@@ -1,0 +1,53 @@
+import logging
+import sys
+from pathlib import Path
+
+from PySide6.QtGui import QIcon
+from PySide6.QtWidgets import QApplication
+
+from utils.config_loader import load_config
+from app.ui import AppUI
+from app.controller import Controller
+from app.floating_ball import FloatingBall
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+
+_ICON = Path(__file__).parent / "voice-recognition.png"
+
+
+def main():
+    config = load_config()
+
+    app = QApplication(sys.argv)
+    app.setApplicationName("语音转文字")
+    app.setQuitOnLastWindowClosed(False)   # 关闭主窗口不退出，悬浮球继续运行
+    if _ICON.exists():
+        app.setWindowIcon(QIcon(str(_ICON)))
+
+    ui         = AppUI()
+    controller = Controller(config, ui)
+    ui.set_controller(controller)
+
+    def _quit():
+        controller.stop()
+        app.quit()
+
+    ball = FloatingBall(
+        on_get_text  = ui.get_text,
+        on_show_main = lambda: (ui.show(), ui.raise_(), ui.activateWindow()),
+        on_start     = controller.start,
+        on_stop      = controller.stop,
+        on_quit      = _quit,
+    )
+    ui.set_ball(ball)
+
+    ui.show()
+    ball.show()
+    sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    main()
