@@ -8,7 +8,6 @@ from PySide6.QtWidgets import QApplication
 from utils.config_loader import load_config
 from app.ui import AppUI
 from app.controller import Controller
-from app.floating_ball import FloatingBall
 
 logging.basicConfig(
     level=logging.INFO,
@@ -23,7 +22,7 @@ def main():
 
     app = QApplication(sys.argv)
     app.setApplicationName("语音转文字")
-    app.setQuitOnLastWindowClosed(False)   # 关闭主窗口不退出，悬浮球继续运行
+    app.setDesktopFileName("asr-voice")   # 匹配 asr-voice.desktop，使 dock 能识别并固定
     if _ICON.exists():
         app.setWindowIcon(QIcon(str(_ICON)))
 
@@ -31,21 +30,7 @@ def main():
     controller = Controller(config, ui)
     ui.set_controller(controller)
 
-    def _quit():
-        controller.stop()
-        app.quit()
-
-    ball = FloatingBall(
-        on_get_text  = ui.get_text,
-        on_show_main = lambda: (ui.show(), ui.raise_(), ui.activateWindow()),
-        on_start     = controller.start,
-        on_stop      = controller.stop,
-        on_quit      = _quit,
-    )
-    ui.set_ball(ball)
-
     ui.show()
-    ball.show()
     sys.exit(app.exec())
 
 
