@@ -1,0 +1,13 @@
+app:
+  sample_rate: 16000
+  chunk_ms: 200        # 官方推荐 200ms，双向流式模式性能最优
+  vad:
+    threshold: 0.005   # 归一化 RMS 阈值（0-1），可按环境调高/调低；0.005 ≈ 普通说话声
+    start_frames: 2    # 连续超阈值帧数触发开始录音（2×200ms = 400ms）
+    end_frames: 12     # 连续低于阈值帧数触发结束录音（12×200ms = 2.4s）
+
+asr:
+  app_id: "7707234985"
+  access_key: "gNOQLQZe2eiEy2ZhTV9YKzXqHxBb6w9H"
+  resource_id: "volc.bigasr.sauc.duration"   # 小时版；并发版用 volc.bigasr.sauc.concurrent
+  ws_url: "wss://openspeech.bytedance.com/api/v3/sauc/bigmodel"
