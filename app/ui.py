@@ -58,6 +58,7 @@ class WaveformWidget(QWidget):
     - CONNECTING 状态：橙色，静止
     - RECORDING 状态：绿色，随人声大幅跳动
     - 非激活：灰色，仅显示静止细条
+    - AI 校正中：DeepSeek 蓝，波浪从左到右连续扫过，表示后台正在处理
     """
 
     _NUM_BARS = 5
@@ -70,6 +71,7 @@ class WaveformWidget(QWidget):
     _COLOR_IDLE       = QColor("#c8c8c8")
     _COLOR_CONNECTING = QColor("#fd7e14")   # 橙
     _COLOR_RECORDING  = QColor("#28a745")   # 绿
+    _COLOR_CORRECTING = QColor("#4D6BFE")   # DeepSeek 品牌蓝，AI 校正中
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -83,6 +85,7 @@ class WaveformWidget(QWidget):
         self._tick        = 0
         self._active      = False
         self._speaking    = False
+        self._correcting  = False
 
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._on_tick)
@@ -98,6 +101,9 @@ class WaveformWidget(QWidget):
 
     def set_speaking(self, speaking: bool):
         self._speaking = speaking
+
+    def set_correcting(self, correcting: bool):
+        self._correcting = correcting
 
     def _on_tick(self):
         self._tick += 1
@@ -116,7 +122,9 @@ class WaveformWidget(QWidget):
         total_bar_w = self._NUM_BARS * self._BAR_W + (self._NUM_BARS - 1) * self._GAP
         sx = (w - total_bar_w) / 2
 
-        if not self._active:
+        if self._correcting:
+            color = self._COLOR_CORRECTING
+        elif not self._active:
             color = self._COLOR_IDLE
         elif self._speaking:
             color = self._COLOR_RECORDING
@@ -127,15 +135,22 @@ class WaveformWidget(QWidget):
         p.setPen(Qt.PenStyle.NoPen)
 
         for i in range(self._NUM_BARS):
-            wave = math.sin(self._tick * 0.18 + self._phases[i])
-            wave_factor = (wave + 1) / 2
-
-            bar_h = (
-                self._MIN_H
-                + (self._MAX_H - self._MIN_H)
-                * self._amp_smooth
-                * (0.55 + 0.45 * wave_factor)
-            )
+            # 每根竖条的相位不同（_phases），随 tick 推进天然形成一道从左到右的波浪
+            if self._correcting:
+                # 校正中：速度放慢、幅度收窄，做一个安静的"处理中"提示，
+                # 不要跟 RECORDING 状态那种随人声大幅跳动抢视觉
+                wave = math.sin(self._tick * 0.08 + self._phases[i])
+                wave_factor = (wave + 1) / 2
+                bar_h = self._MIN_H + (self._MAX_H - self._MIN_H) * (0.18 + 0.32 * wave_factor)
+            else:
+                wave = math.sin(self._tick * 0.18 + self._phases[i])
+                wave_factor = (wave + 1) / 2
+                bar_h = (
+                    self._MIN_H
+                    + (self._MAX_H - self._MIN_H)
+                    * self._amp_smooth
+                    * (0.55 + 0.45 * wave_factor)
+                )
             bar_h = max(self._MIN_H, bar_h)
 
             x = int(sx + i * (self._BAR_W + self._GAP))
@@ -162,6 +177,9 @@ _STATE_COLORS = {
     AppState.STOPPING:   "#fd7e14",
     AppState.ERROR:      "#dc3545",
 }
+
+_CORRECTING_LABEL = "AI 校正中…"
+_CORRECTING_COLOR = "#4D6BFE"   # DeepSeek 品牌蓝
 
 _BTN_STYLE = {
     "start": (
@@ -193,6 +211,13 @@ class AppUI(QMainWindow):
         self._copy_timer.setSingleShot(True)
         self._copy_timer.timeout.connect(self._restore_status_after_copy)
         self._asr_active = False
+        self._programmatic_change = False
+        self._edit_debounce = QTimer(self)
+        self._edit_debounce.setSingleShot(True)
+        self._edit_debounce.timeout.connect(self._commit_manual_edit)
+        self._correction_status_timer = QTimer(self)
+        self._correction_status_timer.setSingleShot(True)
+        self._correction_status_timer.timeout.connect(lambda: self._correction_status_label.clear())
         self._build_ui()
 
     def set_controller(self, controller: "Controller"):
@@ -222,6 +247,14 @@ class AppUI(QMainWindow):
         self._status_label.setFont(font)
         self._status_label.setStyleSheet(f"color: {_STATE_COLORS[AppState.IDLE]};")
         status_row.addWidget(self._status_label)
+
+        # 本地校正模型加载状态：非打扰式小字提示，不占用主状态栏
+        self._correction_status_label = QLabel("")
+        corr_font = self._correction_status_label.font()
+        corr_font.setPointSize(9)
+        self._correction_status_label.setFont(corr_font)
+        status_row.addWidget(self._correction_status_label)
+
         status_row.addStretch()
 
         root.addLayout(status_row)
@@ -237,6 +270,7 @@ class AppUI(QMainWindow):
         text_font.setPointSize(13)
         self._text_area.setFont(text_font)
         self._text_area.setLineWrapMode(QTextEdit.LineWrapMode.WidgetWidth)
+        self._text_area.textChanged.connect(self._on_text_changed)
         root.addWidget(self._text_area, stretch=1)
 
         # Waveform
@@ -283,10 +317,14 @@ class AppUI(QMainWindow):
         # 用户正在选中文本时不打断（允许手动复制）
         if not force and self._text_area.textCursor().hasSelection():
             return
+        if text == self._text_area.toPlainText():
+            return
+        self._programmatic_change = True
         self._text_area.setPlainText(text)
         cursor = self._text_area.textCursor()
         cursor.movePosition(cursor.MoveOperation.End)
         self._text_area.setTextCursor(cursor)
+        self._programmatic_change = False
 
     def get_text(self) -> str:
         return self._text_area.toPlainText()
@@ -308,6 +346,28 @@ class AppUI(QMainWindow):
     def set_waveform_amplitude(self, rms: float):
         self._waveform.set_amplitude(rms)
 
+    def set_correcting(self, correcting: bool):
+        """AI 校正开始/结束时调用：波形条变淡绿色波浪动画，状态栏同步提示。"""
+        self._waveform.set_correcting(correcting)
+        if correcting:
+            self._status_label.setText(_CORRECTING_LABEL)
+            self._status_label.setStyleSheet(f"color: {_CORRECTING_COLOR}; font-weight: bold;")
+        elif self._controller:
+            self.apply_state(self._controller._state)
+
+    def set_correction_status(self, status: str):
+        """本地校正模型加载状态：initializing / ready / failed，非打扰式小字提示。"""
+        if status == "initializing":
+            self._correction_status_label.setText("正在初始化语音校正…")
+            self._correction_status_label.setStyleSheet("color: #6c757d;")
+        elif status == "ready":
+            self._correction_status_label.setText("语音校正已就绪")
+            self._correction_status_label.setStyleSheet("color: #28a745;")
+            self._correction_status_timer.start(2500)
+        elif status == "failed":
+            self._correction_status_label.setText("本地校正暂不可用")
+            self._correction_status_label.setStyleSheet("color: #dc3545;")
+
     def show_error(self, msg: str):
         QMessageBox.critical(self, "错误", msg)
 
@@ -328,6 +388,21 @@ class AppUI(QMainWindow):
     def _on_clear(self):
         if self._controller:
             self._controller.clear()
+
+    def _on_text_changed(self):
+        # 程序自己写入的文本（识别结果/clear）不算"手动编辑"，跳过
+        if self._programmatic_change:
+            return
+        # 只有在识别中才需要处理：识别未激活时文本框本来就不会被覆盖
+        if not self._asr_active:
+            return
+        # 用户还在连续输入时先不提交，停顿 600ms 后再当作一次"编辑"生效，
+        # 避免每敲一个字都去重连一次 ASR
+        self._edit_debounce.start(600)
+
+    def _commit_manual_edit(self):
+        if self._controller:
+            self._controller.rebase(self.get_text())
 
     def _on_copy(self):
         if not self._controller:
@@ -352,5 +427,5 @@ class AppUI(QMainWindow):
 
     def closeEvent(self, event):
         if self._controller:
-            self._controller.stop()
+            self._controller.shutdown()
         event.accept()
