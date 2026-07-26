@@ -1,4 +1,5 @@
 .venv/
+.venv-vulkan-test/
 __pycache__/
 *.pyc
 *.pyo
@@ -11,3 +12,6 @@ build/
 .vscode/
 *.swp
 *.swo
+secrets.yaml
+models/
+identifier.sqlite

@@ -11,3 +11,11 @@ asr:
   access_key: "gNOQLQZe2eiEy2ZhTV9YKzXqHxBb6w9H"
   resource_id: "volc.bigasr.sauc.duration"   # 小时版；并发版用 volc.bigasr.sauc.concurrent
   ws_url: "wss://openspeech.bytedance.com/api/v3/sauc/bigmodel"
+
+correction:
+  enabled: true                              # 停止后是否自动跑一次 AI 校正
+  backend: "local"                           # "local"（本地 Qwen，llama-cpp-python）或 "deepseek"
+  model: "deepseek-v4-flash"
+  base_url: "https://api.deepseek.com/v1/chat/completions"
+  # api_key 从 secrets.yaml 读取（不进 git）
+  local_model_path: "models/qwen2.5-3b-instruct-q4_k_m.gguf"
