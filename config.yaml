@@ -2,14 +2,16 @@ app:
   sample_rate: 16000
   chunk_ms: 200        # 官方推荐 200ms，双向流式模式性能最优
   vad:
-    threshold: 0.005   # 归一化 RMS 阈值（0-1），可按环境调高/调低；0.005 ≈ 普通说话声
-    start_frames: 2    # 连续超阈值帧数触发开始录音（2×200ms = 400ms）
-    end_frames: 12     # 连续低于阈值帧数触发结束录音（12×200ms = 2.4s）
+    threshold: 0.005        # 触发阈值下限（保护值），避免安静环境下噪声基线趋近 0 导致过度灵敏
+    noise_multiplier: 3.5   # 自动模式下，实际触发阈值 = max(threshold, 环境噪声基线 × 该倍数)
+    calibrate_frames: 15    # 自动模式进入等待状态后，先采样这么多帧校准噪声基线（15×200ms≈3s）
+    start_frames: 2         # 连续超阈值帧数触发开始录音（2×200ms = 400ms）
+    end_frames: 8           # 连续低于阈值帧数触发结束录音（8×200ms = 1.6s）；感觉太快/太慢可调这个数字
 
 asr:
-  app_id: "7707234985"
-  access_key: "gNOQLQZe2eiEy2ZhTV9YKzXqHxBb6w9H"
-  resource_id: "volc.bigasr.sauc.duration"   # 小时版；并发版用 volc.bigasr.sauc.concurrent
+  app_id: "7938041955"
+  access_key: "IkTMIQtolJLva_SXZwoCKkiO8XWa7DuK"
+  resource_id: "volc.bigasr.sauc.duration"   # 1.0 小时版；2.0 用 volc.seedasr.sauc.duration
   ws_url: "wss://openspeech.bytedance.com/api/v3/sauc/bigmodel"
 
 correction:

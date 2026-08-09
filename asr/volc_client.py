@@ -161,7 +161,8 @@ class VolcASRClient:
         self._ws_thread.start()
 
         if not self._connected.wait(timeout=8):
-            self._on_error("WebSocket 连接超时（8s）")
+            logger.warning("WebSocket connect timeout after 8s")
+            self._on_error("语音识别服务连接超时，请检查网络后重试")
 
     def send_audio(self, pcm: bytes):
         """发送一帧 PCM 音频，connect() 成功后调用。"""
@@ -212,7 +213,7 @@ class VolcASRClient:
             logger.info("WebSocket closed by server after finish (expected): %s", error)
             return
         logger.error("WebSocket error: %s", error)
-        self._on_error(str(error))
+        self._on_error("语音识别连接中断，请检查网络后重试")
 
     def _on_close(self, ws, code, msg):
         logger.info("WebSocket closed: %s %s", code, msg)
@@ -260,7 +261,8 @@ class VolcASRClient:
                 msg_size = struct.unpack(">I", data[offset:offset + 4])[0]
                 offset += 4
                 error_msg = data[offset:offset + msg_size].decode("utf-8", errors="replace")
-                self._on_error(f"服务器错误 [{error_code}]: {error_msg}")
+                logger.warning("ASR server error [%s]: %s", error_code, error_msg)
+                self._on_error(f"语音识别服务出错（代码 {error_code}），请稍后重试")
             return None
 
         return None

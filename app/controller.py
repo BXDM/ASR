@@ -2,10 +2,13 @@
 Controller — wires together MicRecorder, VolcASRClient, TextBuffer, and UI.
 
 State machine:
-  IDLE ──start()──> CONNECTING ──connected──> RECORDING
-  Any active state ──stop()──> STOPPING ──> IDLE
+  IDLE ──start(), 手动模式──────────────> CONNECTING ──connected──> RECORDING
+  IDLE ──start(), 自动模式（VAD）───────> LISTENING ──检测到人声──> CONNECTING ──connected──> RECORDING
+  RECORDING ──（自动模式下静音超时）────> STOPPING ──> IDLE
+  任意激活状态 ──stop()（手动）─────────> STOPPING ──> IDLE
 """
 
+import collections
 import logging
 import os
 import threading
@@ -21,6 +24,9 @@ from correction.corrector import DeepSeekCorrector
 from correction.local_corrector import LocalQwenCorrector
 
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+# 自动模式下，语音触发瞬间把这段"预录音"一起带上，避免开口的头几个字被切掉
+_PRE_SPEECH_BUF = 5   # 帧数（5×200ms ≈ 1s）
 
 if TYPE_CHECKING:
     from app.ui import AppUI
@@ -52,16 +58,44 @@ class Controller:
         self._corrector: DeepSeekCorrector | LocalQwenCorrector | None = None
         self._init_corrector()
 
+        # ── 自动启停（VAD）相关状态 ─────────────────────────────────────────
+        vad_cfg = config.get("app", {}).get("vad", {})
+        self._vad_min_threshold   = float(vad_cfg.get("threshold", 0.005))
+        self._vad_noise_multiplier = float(vad_cfg.get("noise_multiplier", 3.5))
+        self._vad_calibrate_frames = int(vad_cfg.get("calibrate_frames", 15))
+        self._vad_start_frames    = int(vad_cfg.get("start_frames", 2))
+        self._vad_end_frames      = int(vad_cfg.get("end_frames", 8))
+
+        self._auto_vad = False   # UI 复选框「自动启停」的开关状态
+        # 静音超时触发的自动停止，结束后要免手动点一下「复制」；
+        # 手动点「停止」不算，只有 _on_audio 里 VAD 判定的静音超时会置位
+        self._auto_stop_pending = False
+
+        # LISTENING 阶段滚动保存最近几帧（触发时随首句一起发出去）；
+        # 一旦触发，转入 _inflight 持续追加，直到 ASR 连接成功后一次性补发
+        self._pre_buf: collections.deque[bytes] = collections.deque(maxlen=_PRE_SPEECH_BUF)
+        self._inflight: list[bytes] = []
+
+        # 噪声基线校准 + VAD 帧计数（每次进入 LISTENING 时由 _vad_reset() 清零）
+        self._calib_samples: list[float] = []
+        self._vad_active_threshold = self._vad_min_threshold
+        self._speech_frames = 0
+        self._silence_frames = 0
+
     # ── Public commands (called from UI thread) ─────────────────────────────
 
     def start(self):
-        """开启麦克风，立即连接 ASR 开始识别。"""
+        """开启麦克风。手动模式立即连接 ASR；自动模式先进入 LISTENING，等检测到人声再连接。"""
         with self._state_lock:
             if self._state not in (AppState.IDLE, AppState.ERROR):
                 return
-            self._set_state(AppState.CONNECTING)
+            auto = self._auto_vad
+            self._set_state(AppState.LISTENING if auto else AppState.CONNECTING)
 
-        threading.Thread(target=self._start_recording, daemon=True).start()
+        if auto:
+            threading.Thread(target=self._start_listening, daemon=True).start()
+        else:
+            threading.Thread(target=self._start_recording, daemon=True).start()
 
     def stop(self):
         """关闭一切，回到 IDLE。"""
@@ -71,6 +105,10 @@ class Controller:
             self._set_state(AppState.STOPPING)
 
         threading.Thread(target=self._stop_all, daemon=True).start()
+
+    def set_auto_vad(self, enabled: bool):
+        """切换自动启停开关（下次 start() 生效，进行中的会话不受影响）。"""
+        self._auto_vad = enabled
 
     def shutdown(self):
         """程序退出前调用：停止录音，并释放常驻的本地校正模型。
@@ -113,11 +151,12 @@ class Controller:
 
     # ── Recording session ────────────────────────────────────────────────────
 
-    def _start_recording(self):
+    def _reset_session(self):
         self._committed_text = ""
         self._current_text = ""
         self._buffer.clear()
 
+    def _open_mic(self) -> bool:
         app_cfg = self._cfg["app"]
         self._recorder = MicRecorder(
             sample_rate=app_cfg["sample_rate"],
@@ -126,11 +165,34 @@ class Controller:
         )
         try:
             self._recorder.start()
+            return True
         except Exception as e:
-            self._handle_error(f"麦克风启动失败: {e}")
-            return
+            logger.warning("麦克风启动失败: %s", e)
+            self._handle_error("麦克风启动失败，请检查麦克风权限或是否被其他程序占用")
+            return False
 
+    def _start_recording(self):
+        """手动模式：开麦后立即连接 ASR。"""
+        self._reset_session()
+        if not self._open_mic():
+            return
         self._connect_asr()
+
+    def _start_listening(self):
+        """自动模式：只开麦、不连 ASR，等 _on_audio 里的 VAD 检测到人声再触发连接。"""
+        self._reset_session()
+        self._vad_reset()
+        self._ui.schedule(lambda: self._ui.set_calibrating(True))
+        self._open_mic()
+
+    def _vad_reset(self):
+        """每次进入 LISTENING 时清零噪声校准与帧计数。"""
+        self._calib_samples = []
+        self._vad_active_threshold = self._vad_min_threshold
+        self._speech_frames = 0
+        self._silence_frames = 0
+        self._pre_buf.clear()
+        self._inflight = []
 
     def _stop_all(self):
         recorder, self._recorder = self._recorder, None
@@ -148,16 +210,31 @@ class Controller:
         with self._state_lock:
             self._set_state(AppState.IDLE)
 
-        self._maybe_run_correction()
+        # 只有静音超时触发的自动停止才顺带自动复制；手动点「停止」不会
+        auto_copy = self._auto_stop_pending
+        self._auto_stop_pending = False
 
-    def _maybe_run_correction(self):
+        if not self._maybe_run_correction(auto_copy):
+            # 没有跑校正（未启用/没装好/没内容）：文本已经是最终结果，直接复制
+            if auto_copy:
+                self._auto_copy_result()
+
+    def _maybe_run_correction(self, auto_copy: bool = False) -> bool:
+        """尝试起一次 AI 校正。返回是否真的起了后台线程——调用方用这个判断
+        "最终文本是不是还要再等校正跑完"，从而决定自动复制该现在做还是等校正完再做。"""
         corr_cfg = self._cfg.get("correction", {})
         if not corr_cfg.get("enabled"):
-            return
+            return False
         text = self._committed_text.strip()
         if not text:
-            return
-        threading.Thread(target=self._run_correction, args=(text,), daemon=True).start()
+            return False
+        threading.Thread(target=self._run_correction, args=(text, auto_copy), daemon=True).start()
+        return True
+
+    def _auto_copy_result(self):
+        text = self._committed_text.strip()
+        if text:
+            self._ui.schedule(lambda t=text: self._ui.auto_copy(t))
 
     def _init_corrector(self):
         """程序启动时调用（构造函数里，同步、很快）：创建校正器实例。
@@ -194,20 +271,26 @@ class Controller:
         status = "ready" if corrector.state == "READY" else "failed"
         self._ui.schedule(lambda s=status: self._ui.set_correction_status(s))
 
-    def _run_correction(self, original_text: str):
+    def _run_correction(self, original_text: str, auto_copy: bool = False):
         """后台线程：调用 AI 校正接口，修正重复词/明显误听词并直接替换显示文本。"""
         corrector = self._corrector
         if corrector is None:
+            if auto_copy:
+                self._auto_copy_result()
             return
 
         if isinstance(corrector, LocalQwenCorrector) and corrector.state != "READY":
             if corrector.state == "FAILED":
                 self._ui.schedule(lambda: self._ui.set_correction_status("failed"))
+                if auto_copy:
+                    self._auto_copy_result()
                 return
             # 模型仍在 LOADING（刚启动就录音的情况）：短暂等待就绪再校正，
             # 而不是直接放弃——录音本身完全不受影响，早就开始了。
             if not corrector.wait_ready(timeout=15.0):
                 self._ui.schedule(lambda: self._ui.set_correction_status("failed"))
+                if auto_copy:
+                    self._auto_copy_result()
                 return
 
         self._ui.schedule(lambda: self._ui.set_correcting(True))
@@ -230,6 +313,10 @@ class Controller:
             self._ui.schedule(lambda t=corrected: self._ui.set_text(t, force=True))
         finally:
             self._ui.schedule(lambda: self._ui.set_correcting(False))
+            # 自动模式静音自动停止：等校正跑完（不管是否真的改了字）再复制最终文本，
+            # 免得用户还要再手动点一次「复制」
+            if auto_copy:
+                self._auto_copy_result()
 
     # ── Audio callback (called from sounddevice audio thread) ────────────────
 
@@ -238,39 +325,118 @@ class Controller:
         rms = float(np.sqrt(np.mean(samples ** 2))) / 32768.0
         self._ui.schedule(lambda r=rms: self._ui.set_waveform_amplitude(r))
 
+        # 静音超时触发的自动停止要放到锁外调用（stop() 自己会取锁，避免死锁）
+        should_auto_stop = False
+
         with self._state_lock:
             state = self._state
 
-        if state == AppState.RECORDING and self._asr:
-            self._asr.send_audio(pcm)
+            if state == AppState.LISTENING:
+                self._pre_buf.append(pcm)
+
+                # 前 N 帧只用来校准环境噪声基线，不做触发判断。
+                # 用中位数会被"校准期间用户已经开始说话"污染（说话的 RMS 混进样本，
+                # 把噪声基线拉得很高，导致后面怎么说话都触发不了）——改用低百分位数，
+                # 只要校准窗口里有相当一部分时间是真安静的，就能拿到靠谱的基线。
+                if len(self._calib_samples) < self._vad_calibrate_frames:
+                    self._calib_samples.append(rms)
+                    if len(self._calib_samples) == self._vad_calibrate_frames:
+                        ordered = sorted(self._calib_samples)
+                        noise_floor = ordered[max(0, len(ordered) // 4 - 1)]
+                        self._vad_active_threshold = max(
+                            self._vad_min_threshold,
+                            noise_floor * self._vad_noise_multiplier,
+                        )
+                        self._ui.schedule(lambda: self._ui.set_calibrating(False))
+                else:
+                    if rms > self._vad_active_threshold:
+                        self._speech_frames += 1
+                    else:
+                        self._speech_frames = 0
+
+                    if self._speech_frames >= self._vad_start_frames:
+                        self._speech_frames = 0
+                        # 把预录音缓冲整体转入 inflight，连接期间新到的帧也会持续追加进来
+                        self._inflight = list(self._pre_buf)
+                        self._pre_buf.clear()
+                        self._set_state(AppState.CONNECTING)
+                        threading.Thread(target=self._connect_asr, daemon=True).start()
+
+            elif state == AppState.CONNECTING:
+                # ASR 握手（最长 8s）期间不能把音频丢掉，否则开头几个字会被切掉，
+                # 攒进 inflight，连接成功后一次性按顺序补发
+                self._inflight.append(pcm)
+
+            elif state == AppState.RECORDING:
+                if self._asr:
+                    self._asr.send_audio(pcm)
+
+                if self._auto_vad:
+                    if rms > self._vad_active_threshold:
+                        self._silence_frames = 0
+                    else:
+                        self._silence_frames += 1
+                        if self._silence_frames >= self._vad_end_frames:
+                            self._silence_frames = 0
+                            should_auto_stop = True
+                            self._auto_stop_pending = True
+
+        if should_auto_stop:
+            self.stop()
 
     # ── ASR session helpers ──────────────────────────────────────────────────
 
     def _connect_asr(self):
-        """后台线程：建立 ASR 连接，成功后进入 RECORDING。"""
+        """后台线程：建立 ASR 连接，成功后进入 RECORDING。
+
+        回调必须带 generation 校验（跟 _reconnect_asr 一样）——之前这里是直接把
+        self._on_asr_result 传给 VolcASRClient，没有校验；如果清空/重新开始时旧连接
+        还有一条结果消息在飞（服务端已经发出、客户端还没处理完），旧回调会照样把已经
+        被清空的文本又写回界面（表现为点一次清空没生效、要点两次才真的清空）。
+        """
+        with self._state_lock:
+            self._asr_generation += 1
+            gen = self._asr_generation
+
+        def guarded_result(result):
+            if gen == self._asr_generation:
+                self._on_asr_result(result)
+
+        def guarded_error(msg):
+            if gen == self._asr_generation:
+                self._on_asr_error(msg)
+
         asr_cfg = self._cfg["asr"]
         new_asr = VolcASRClient(
             ws_url=asr_cfg["ws_url"],
             app_id=asr_cfg["app_id"],
             access_key=asr_cfg["access_key"],
             resource_id=asr_cfg["resource_id"],
-            on_result=self._on_asr_result,
-            on_error=self._on_asr_error,
+            on_result=guarded_result,
+            on_error=guarded_error,
         )
 
         try:
             new_asr.connect()
         except Exception as e:
             logger.warning("ASR connect error: %s", e)
-            self._handle_error(f"ASR 连接失败: {e}")
+            self._handle_error("语音识别服务连接失败，请检查网络后重试")
             return
 
         with self._state_lock:
-            if self._state != AppState.CONNECTING:
+            if self._state != AppState.CONNECTING or gen != self._asr_generation:
                 threading.Thread(target=self._finish_asr, args=(new_asr,), daemon=True).start()
                 return
             self._current_text = ""
             self._asr = new_asr
+            # 补发 LISTENING 预录音 + CONNECTING 期间攒下的音频，必须在切到 RECORDING
+            # 之前发完，否则会和音频线程后续实时帧的发送顺序乱掉（见并发设计说明）
+            inflight, self._inflight = self._inflight, []
+            for chunk in inflight:
+                try:
+                    new_asr.send_audio(chunk)
+                except Exception:
+                    pass
             self._set_state(AppState.RECORDING)
 
     def _discard_asr(self, asr: VolcASRClient):
@@ -305,7 +471,7 @@ class Controller:
         except Exception as e:
             logger.warning("ASR 重连失败: %s", e)
             if gen == self._asr_generation:
-                self._handle_error(f"ASR 重连失败: {e}")
+                self._handle_error("语音识别重连失败，请检查网络后重试")
             return
 
         with self._state_lock:
