@@ -28,6 +28,7 @@ from PySide6.QtWidgets import (
 
 from app.state import AppState
 from app.clipboard_util import copy_to_clipboard
+from app.voice_capsule import VoiceCapsule
 
 if TYPE_CHECKING:
     from app.controller import Controller
@@ -505,6 +506,21 @@ class AppUI(QMainWindow):
         btn_row.addStretch()
         root.addLayout(btn_row)
 
+        # 语音状态胶囊：只在"自动启停"会话真正跑起来时才会出现，
+        # 显隐/内容完全由 _sync_capsule 根据 AppState 驱动，见下方。
+        #
+        # 故意不传 parent：试过 parent=self（让胶囊挂靠主窗口，指望 dock 图标
+        # 不再显示两个点），结果主窗口一被最小化，胶囊被合成器当成"从属物"
+        # 一起最小化掉了——这是本末倒置，胶囊存在的意义就是主窗口不用管、
+        # 甚至可以被最小化的时候还能常驻后台。dock 下面显示两个点这个瑕疵
+        # 目前没有能两全的办法（原生 Wayland 下 Qt 没有可靠的"从任务栏隐藏
+        # 顶层窗口"协议，不挂 parent 才是唯一路径），两害相权，保功能优先。
+        self._capsule = VoiceCapsule(
+            on_show_main=self._show_main_window,
+            on_stop=self._on_stop,   # 复用现成的手动停止逻辑
+            on_quit=self.close,      # 复用现成的 closeEvent -> controller.shutdown()
+        )
+
     # ── Public methods (safe to call from any thread via schedule()) ─────────
 
     def set_text(self, text: str, *, force: bool = False):
@@ -541,8 +557,48 @@ class AppUI(QMainWindow):
         self._waveform.set_active(active)
         self._waveform.set_speaking(state == AppState.RECORDING)
 
+        self._sync_capsule(state)
+
+    def _sync_capsule(self, state: AppState):
+        """语音胶囊只在"自动启停"会话真正跑起来时才出现——手动模式、
+        或勾了自动开关但没有会话在跑，都不显示。
+
+        状态映射：LISTENING（等人声，还没触发）→ 收起的小圆点；
+        CONNECTING/RECORDING（正在收音识别）→ 展开波形；
+        STOPPING → 转圈"正在识别…"（能走到这一步、胶囊还开着的，只有
+        静音超时触发的自动收尾——手动点停止/关自动开关都会在下面
+        _on_stop/_on_auto_toggled 里提前把胶囊藏起来，不会经过这里）；
+        ERROR → 闪一下错误提示，自动收起。
+        """
+        auto = self._auto_toggle.isChecked()
+        if state == AppState.IDLE or not auto:
+            self._capsule.hide()
+            return
+
+        self._capsule.set_anchor_screen(self.screen())
+        if state == AppState.LISTENING:
+            self._capsule.show_dot()
+        elif state in (AppState.CONNECTING, AppState.RECORDING):
+            self._capsule.show_listening()
+        elif state == AppState.STOPPING:
+            self._capsule.show_processing()
+        elif state == AppState.ERROR:
+            self._capsule.flash_error()
+
+    def _show_main_window(self):
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
     def set_waveform_amplitude(self, rms: float):
         self._waveform.set_amplitude(rms)
+        self._capsule.set_amplitude(rms)
+
+    def set_capsule_quieting(self, quieting: bool):
+        """自动模式下：检测到静音、正在倒数要不要停（还没真正判定停止）——
+        胶囊在这个阶段变橙色示警，跟"正在说话"的绿色、"真正在识别"的蓝色
+        区分开。只在 Listening 视觉下才有意义，直接转发给胶囊自己判断。"""
+        self._capsule.set_quieting(quieting)
 
     def set_correcting(self, correcting: bool):
         """AI 校正开始/结束时调用：波形条变淡绿色波浪动画，状态栏同步提示。"""
@@ -578,6 +634,10 @@ class AppUI(QMainWindow):
             self._correction_status_label.setStyleSheet("color: #dc3545;")
 
     def show_error(self, msg: str):
+        # 自动模式下主窗口平时是收起来的（见 _on_auto_toggled）；出错的时候
+        # 把它叫回来再弹提示，不然错误弹窗孤零零跳出来，旁边啥上下文都没有
+        if not self.isVisible():
+            self._show_main_window()
         QMessageBox.critical(self, "错误", msg)
 
     def schedule(self, fn: Callable):
@@ -592,16 +652,26 @@ class AppUI(QMainWindow):
 
     def _on_stop(self):
         if self._controller:
+            if self._auto_toggle.isChecked():
+                # 手动点停止：胶囊立刻消失，不要先闪一下"正在识别…"
+                self._capsule.hide()
             self._controller.stop()
 
     def _on_auto_toggled(self, checked: bool):
         """自动启停开关本身就是启停触发器：待机时打开＝立刻开始监听；
-        运行中关掉＝立刻整个停掉回到待机（跟点「暂停监听」按钮效果一样）。"""
+        运行中关掉＝立刻整个停掉回到待机（跟点「暂停监听」按钮效果一样）。
+
+        打开的同时把主窗口收起来——运行期间只留胶囊一个窗口可见，不用
+        再纠结"任务栏显示两个点"这种问题（压根没有第二个可见窗口）；
+        想找回主窗口（比如要关掉自动启停），点一下胶囊就行
+        （见 VoiceCapsule 的 on_show_main → _show_main_window）。
+        """
         if not self._controller:
             return
         self._controller.set_auto_vad(checked)
         if checked:
             self._controller.start()
+            self.hide()
         else:
             self._controller.stop()
 
@@ -682,6 +752,8 @@ class AppUI(QMainWindow):
             return
         if copy_to_clipboard(text):
             self._show_copied_feedback("已自动复制到剪贴板")
+            if self._auto_toggle.isChecked():
+                self._capsule.flash_copied()
 
     def _show_copied_feedback(self, status_text: str):
         # 只改上面的状态提示，按钮本身的文字/图标不要跟着变——之前改了会变得很跳
