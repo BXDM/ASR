@@ -6,7 +6,7 @@ app:
     noise_multiplier: 3.5   # 自动模式下，实际触发阈值 = max(threshold, 环境噪声基线 × 该倍数)
     calibrate_frames: 15    # 自动模式进入等待状态后，先采样这么多帧校准噪声基线（15×200ms≈3s）
     start_frames: 2         # 连续超阈值帧数触发开始录音（2×200ms = 400ms）
-    end_frames: 8           # 连续低于阈值帧数触发结束录音（8×200ms = 1.6s）；感觉太快/太慢可调这个数字
+    end_frames: 15          # 连续低于阈值帧数触发结束录音（15×200ms = 3s）；感觉太快/太慢可调这个数字
 
 asr:
   app_id: "7938041955"
@@ -15,7 +15,7 @@ asr:
   ws_url: "wss://openspeech.bytedance.com/api/v3/sauc/bigmodel"
 
 correction:
-  enabled: true                              # 停止后是否自动跑一次 AI 校正
+  enabled: false                             # 停止后是否自动跑一次 AI 校正
   backend: "local"                           # "local"（本地 Qwen，llama-cpp-python）或 "deepseek"
   model: "deepseek-v4-flash"
   base_url: "https://api.deepseek.com/v1/chat/completions"

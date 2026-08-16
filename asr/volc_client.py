@@ -32,7 +32,6 @@ import gzip
 import json
 import struct
 import threading
-import time
 import uuid
 import logging
 from typing import Callable
@@ -129,6 +128,7 @@ class VolcASRClient:
         self._ws_thread: threading.Thread | None = None
         self._send_lock = threading.Lock()
         self._connected = threading.Event()
+        self._closed = threading.Event()
         self._running = False
 
     # ── Public API ──────────────────────────────────────────────────────────
@@ -176,17 +176,24 @@ class VolcASRClient:
                 logger.warning("send_audio error: %s", e)
 
     def finish(self):
-        """发送最后一帧（last flag），等待服务端返回最终结果后关闭连接。"""
+        """发送最后一帧（last flag），等待服务端返回最终结果后关闭连接。
+
+        服务端处理完最后一帧、把所有结果都发完之后会主动关闭连接（见
+        _on_close）——等这个信号，而不是不管三七二十一死等固定 1 秒：
+        实际处理通常比 1 秒快很多，这里等到就立刻往下走；服务端万一没有
+        主动关闭，1 秒兜底超时依然保证不会卡死。
+        """
         if not self._running:
             return
         self._running = False
+        self._closed.clear()
         with self._send_lock:
             frame = _build_audio_frame(b"", is_last=True)
             try:
                 self._ws.send(frame, opcode=websocket.ABNF.OPCODE_BINARY)
             except Exception:
                 pass
-        time.sleep(1.0)   # 等待服务端发回最终结果
+        self._closed.wait(timeout=1.0)
         try:
             self._ws.close()
         except Exception:
@@ -218,6 +225,7 @@ class VolcASRClient:
     def _on_close(self, ws, code, msg):
         logger.info("WebSocket closed: %s %s", code, msg)
         self._connected.clear()
+        self._closed.set()
 
     # ── Binary frame decoder ────────────────────────────────────────────────
 

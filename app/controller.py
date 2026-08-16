@@ -4,8 +4,8 @@ Controller — wires together MicRecorder, VolcASRClient, TextBuffer, and UI.
 State machine:
   IDLE ──start(), 手动模式──────────────> CONNECTING ──connected──> RECORDING
   IDLE ──start(), 自动模式（VAD）───────> LISTENING ──检测到人声──> CONNECTING ──connected──> RECORDING
-  RECORDING ──（自动模式下静音超时）────> STOPPING ──> IDLE
-  任意激活状态 ──stop()（手动）─────────> STOPPING ──> IDLE
+  RECORDING ──（自动模式下静音超时）────> STOPPING ──自动复制──> LISTENING（循环下一轮，麦克风不关）
+  任意激活状态 ──stop()（手动）/ 关闭自动开关 ─> STOPPING ──> IDLE
 """
 
 import collections
@@ -70,6 +70,9 @@ class Controller:
         # 静音超时触发的自动停止，结束后要免手动点一下「复制」；
         # 手动点「停止」不算，只有 _on_audio 里 VAD 判定的静音超时会置位
         self._auto_stop_pending = False
+        # 用户手动点「停止」（或关闭自动启停开关）触发的标记：即使此刻正好赶上
+        # 静音超时收尾的间隙，也要让本轮以彻底停止收场，不再循环回 LISTENING
+        self._manual_stop = False
 
         # LISTENING 阶段滚动保存最近几帧（触发时随首句一起发出去）；
         # 一旦触发，转入 _inflight 持续追加，直到 ASR 连接成功后一次性补发
@@ -90,6 +93,7 @@ class Controller:
             if self._state not in (AppState.IDLE, AppState.ERROR):
                 return
             auto = self._auto_vad
+            self._manual_stop = False
             self._set_state(AppState.LISTENING if auto else AppState.CONNECTING)
 
         if auto:
@@ -98,9 +102,17 @@ class Controller:
             threading.Thread(target=self._start_recording, daemon=True).start()
 
     def stop(self):
-        """关闭一切，回到 IDLE。"""
+        """关闭一切，回到 IDLE。
+
+        自动模式下可能正好赶上静音超时触发的收尾（本该循环回 LISTENING）——
+        这里先把 _manual_stop 标记打上，_stop_all 收尾时会看到这个标记改为彻底停止，
+        不会再悄悄回到 LISTENING 而对用户的停止操作毫无反应。
+        """
         with self._state_lock:
-            if self._state in (AppState.IDLE, AppState.STOPPING):
+            if self._state == AppState.IDLE:
+                return
+            self._manual_stop = True
+            if self._state == AppState.STOPPING:
                 return
             self._set_state(AppState.STOPPING)
 
@@ -181,34 +193,37 @@ class Controller:
     def _start_listening(self):
         """自动模式：只开麦、不连 ASR，等 _on_audio 里的 VAD 检测到人声再触发连接。"""
         self._reset_session()
-        self._vad_reset()
+        self._vad_reset(recalibrate=True)
         self._ui.schedule(lambda: self._ui.set_calibrating(True))
         self._open_mic()
 
-    def _vad_reset(self):
-        """每次进入 LISTENING 时清零噪声校准与帧计数。"""
-        self._calib_samples = []
-        self._vad_active_threshold = self._vad_min_threshold
+    def _vad_reset(self, recalibrate: bool):
+        """每次进入 LISTENING 时清零帧计数。
+
+        recalibrate=True（整个自动会话第一次开始）才重新采样噪声基线——
+        这个过程要 calibrate_frames 帧（约 3s），期间完全不检测人声。
+        循环到下一轮（recalibrate=False）时环境噪声基本没变，没必要每轮都
+        重新校准一次，直接沿用上一次算出来的阈值，这样下一句开口才能立刻
+        被听到，不会有"已经在说话了胶囊才反应"这种延迟。
+        """
+        if recalibrate:
+            self._calib_samples = []
+            self._vad_active_threshold = self._vad_min_threshold
         self._speech_frames = 0
         self._silence_frames = 0
         self._pre_buf.clear()
         self._inflight = []
 
     def _stop_all(self):
-        recorder, self._recorder = self._recorder, None
-        if recorder:
-            try:
-                recorder.stop()
-            except Exception as e:
-                logger.warning("recorder stop error: %s", e)
+        """结束当前这一轮 ASR 会话。
 
+        两种收尾方式：
+        - 手动停止 / 关闭自动启停开关：彻底关掉麦克风，回到 IDLE。
+        - 自动模式下静音超时触发（且期间没有被手动打断）：ASR 连接断开、自动复制，
+          但麦克风不关，直接回到 LISTENING 等下一句，循环进行下一轮自动识别。
+        """
         self._finish_asr(self._asr)
         self._asr = None
-
-        self._ui.schedule(lambda: self._ui.set_waveform_amplitude(0.0))
-
-        with self._state_lock:
-            self._set_state(AppState.IDLE)
 
         # 只有静音超时触发的自动停止才顺带自动复制；手动点「停止」不会
         auto_copy = self._auto_stop_pending
@@ -218,6 +233,33 @@ class Controller:
             # 没有跑校正（未启用/没装好/没内容）：文本已经是最终结果，直接复制
             if auto_copy:
                 self._auto_copy_result()
+
+        with self._state_lock:
+            loop_back = auto_copy and self._auto_vad and not self._manual_stop
+            self._manual_stop = False
+            if loop_back:
+                self._vad_reset(recalibrate=False)   # 沿用已校准好的阈值，不重新校准
+                self._set_state(AppState.LISTENING)
+
+        if loop_back:
+            # 每一轮独立：清空上一轮的文本再进入下一轮，不跨轮累积
+            self._reset_session()
+            self._ui.schedule(lambda: self._ui.set_text("", force=True))
+            # 麦克风全程没停，噪声基线沿用上一轮的，不用再等 3 秒重新校准，
+            # 直接就能听人声了
+            return
+
+        recorder, self._recorder = self._recorder, None
+        if recorder:
+            try:
+                recorder.stop()
+            except Exception as e:
+                logger.warning("recorder stop error: %s", e)
+
+        self._ui.schedule(lambda: self._ui.set_waveform_amplitude(0.0))
+
+        with self._state_lock:
+            self._set_state(AppState.IDLE)
 
     def _maybe_run_correction(self, auto_copy: bool = False) -> bool:
         """尝试起一次 AI 校正。返回是否真的起了后台线程——调用方用这个判断
@@ -325,8 +367,8 @@ class Controller:
         rms = float(np.sqrt(np.mean(samples ** 2))) / 32768.0
         self._ui.schedule(lambda r=rms: self._ui.set_waveform_amplitude(r))
 
-        # 静音超时触发的自动停止要放到锁外调用（stop() 自己会取锁，避免死锁）
-        should_auto_stop = False
+        # 静音超时触发的收尾要放到后台线程做（避免在音频回调里做网络 I/O）
+        should_cycle_stop = False
 
         with self._state_lock:
             state = self._state
@@ -378,11 +420,23 @@ class Controller:
                         self._silence_frames += 1
                         if self._silence_frames >= self._vad_end_frames:
                             self._silence_frames = 0
-                            should_auto_stop = True
                             self._auto_stop_pending = True
+                            self._set_state(AppState.STOPPING)
+                            should_cycle_stop = True
 
-        if should_auto_stop:
-            self.stop()
+                    # 静音倒数过半了还没恢复说话，才给胶囊提前量、从"说话中"
+                    # 变成"检测到静音、正在倒数要不要停"——之前门槛设的是
+                    # 2 帧（~400ms），说话中间词与词之间正常的停顿随便就有
+                    # 这么长，结果变成一直在说话橙色也跟着一直闪，本末倒置。
+                    # 改成倒数过半（约 2.5s）才开始示警，留够"这确实是要停了、
+                    # 不是正常换气"的判断余量。should_cycle_stop 那一刻已经把
+                    # _silence_frames 清零了，这里算出来自然就是 False。
+                    quieting_threshold = max(1, self._vad_end_frames // 2)
+                    quieting = quieting_threshold <= self._silence_frames < self._vad_end_frames
+                    self._ui.schedule(lambda q=quieting: self._ui.set_capsule_quieting(q))
+
+        if should_cycle_stop:
+            threading.Thread(target=self._stop_all, daemon=True).start()
 
     # ── ASR session helpers ──────────────────────────────────────────────────
 
