@@ -472,6 +472,10 @@ class Controller:
 
         try:
             new_asr.connect()
+        except TimeoutError:
+            logger.warning("ASR connect timeout")
+            self._handle_error("语音识别服务连接超时，请检查网络后重试")
+            return
         except Exception as e:
             logger.warning("ASR connect error: %s", e)
             self._handle_error("语音识别服务连接失败，请检查网络后重试")
@@ -567,11 +571,36 @@ class Controller:
         self._ui.schedule(lambda t=display: self._ui.set_text(t))
 
     def _on_asr_error(self, msg: str):
+        """ASR 后台线程报错：不管当前在哪个状态，都停麦克风、废连接、回到 ERROR。
+
+        之前只有 RECORDING 才复位，CONNECTING 阶段出错会原地卡死在 CONNECTING：
+        麦克风不关、_on_audio 继续无上限往 _inflight 堆音频帧，界面既不在识别
+        也回不到 IDLE。同时这里自增 generation 作废这条连接后续的所有回调——
+        一条连接断开往往会连着抛好几条错误，不作废的话每条都要弹一次提示。
+        """
         logger.warning("ASR error: %s", msg)
+
         with self._state_lock:
-            if self._state == AppState.RECORDING:
-                self._asr = None
-                self._set_state(AppState.ERROR)
+            if self._state in (AppState.IDLE, AppState.ERROR):
+                return   # 已经收拾干净了，同一次故障的后续错误直接忽略
+            old_asr, self._asr = self._asr, None
+            self._asr_generation += 1
+            self._set_state(AppState.ERROR)
+
+        # 注意本函数跑在 websocket 回调线程上，不能在这里直接 finish()：
+        # finish() 要等 _on_close，而 _on_close 正是这个线程接下来才会跑的回调，
+        # 只会白白干等到超时。丢给后台线程去优雅关闭。
+        if old_asr:
+            threading.Thread(target=self._discard_asr, args=(old_asr,), daemon=True).start()
+
+        recorder, self._recorder = self._recorder, None
+        if recorder:
+            try:
+                recorder.stop()
+            except Exception as e:
+                logger.warning("recorder stop error: %s", e)
+
+        self._ui.schedule(lambda: self._ui.set_waveform_amplitude(0.0))
         self._ui.schedule(lambda m=msg: self._ui.show_error(m))
 
     def _handle_error(self, msg: str):

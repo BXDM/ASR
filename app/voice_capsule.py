@@ -62,6 +62,9 @@ class _Visual(Enum):
 _BG_TOP     = QColor(28, 33, 40, 205)    # 背板深色渐变（上深下更深），透一点、不是纯色块
 _BG_BOTTOM  = QColor(17, 21, 27, 205)
 _TEXT_COLOR       = QColor(255, 255, 255, 230)  # ~90% 白，不用纯白——文字是辅助，别抢过波形
+_COLOR_IDLE       = QColor("#04DDFE")   # 待机等人声：科技蓝（取自那张科技感底图里发光线条/核心光晕的青蓝）。
+                                        # 底图大面积的宝蓝 #0F3FE5 没用——胶囊背板本来就是近黑半透明，
+                                        # 深宝蓝压上去麦克风图标会糊成一团；这个青蓝亮度够、跟绿色也一眼分得开
 _COLOR_LISTENING  = QColor("#31C56B")
 _COLOR_QUIETING   = QColor("#FD7E14")   # 检测到静音、倒数要不要停的中间态：橙色
 _COLOR_PROCESSING = QColor("#4D8DFF")
@@ -103,6 +106,9 @@ _LABELS = {
 }
 
 _VISUAL_COLOR = {
+    # 收起态＝麦克风开着但还没听到人声，用蓝色；一旦检测到人声、展开成波形
+    # 就切绿色。颜色本身就是"听到没听到"的指示器，不用盯着波形动没动
+    _Visual.DOT:        _COLOR_IDLE,
     _Visual.LISTENING:  _COLOR_LISTENING,
     _Visual.PROCESSING: _COLOR_PROCESSING,
     _Visual.COPIED:     _COLOR_COPIED,
@@ -177,7 +183,9 @@ class VoiceCapsule(QWidget):
         self._border_phase = 0.0  # 展开态边框"跑马灯"高光的旋转角度
         # 边框/图标底座的"当前颜色"，每帧朝目标状态色 _lerp_color 过去，
         # 状态切换时是平滑过渡而不是瞬间跳变（比如绿→蓝）
-        self._current_color = QColor(_COLOR_LISTENING)
+        # 胶囊第一次出现时是收起态（等人声），初值就用蓝——否则一露面会先
+        # 从绿色淡入蓝色，看着像状态跳了一下
+        self._current_color = QColor(_COLOR_IDLE)
         # Listening 态下的"检测到静音、正在倒数要不要停"子状态——跟 AppState
         # 本身无关（Controller 那边还是 RECORDING），只是多一路信号让胶囊
         # 提前变橙色示警，不用等整整 5 秒静音超时真正触发 STOPPING 才变色
@@ -309,7 +317,7 @@ class VoiceCapsule(QWidget):
     def _target_color(self) -> QColor:
         if self._visual == _Visual.LISTENING and self._quieting:
             return _COLOR_QUIETING
-        return _VISUAL_COLOR.get(self._visual, _COLOR_LISTENING)
+        return _VISUAL_COLOR.get(self._visual, _COLOR_IDLE)
 
     def moveEvent(self, event):
         super().moveEvent(event)
