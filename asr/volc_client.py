@@ -162,7 +162,18 @@ class VolcASRClient:
 
         if not self._connected.wait(timeout=8):
             logger.warning("WebSocket connect timeout after 8s")
-            self._on_error("语音识别服务连接超时，请检查网络后重试")
+            # 超时必须把这条连接彻底废掉再抛出去。之前只回调一下 on_error 就正常
+            # 返回，_running 还是 True、run_forever 也还在后台跑——调用方以为连接
+            # 失败、却因为没有异常而继续把状态推进到 RECORDING，紧接着这条连接
+            # 自己又连上了，于是音频抢在 full client request 之前发了出去，服务端
+            # 报 45000000 后立刻断开，一串错误接连炸出来。
+            self._running = False
+            self._connected.clear()
+            try:
+                self._ws.close()
+            except Exception:
+                pass
+            raise TimeoutError("语音识别服务连接超时")
 
     def send_audio(self, pcm: bytes):
         """发送一帧 PCM 音频，connect() 成功后调用。"""

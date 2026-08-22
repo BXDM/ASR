@@ -22,7 +22,7 @@ from PySide6.QtCore import Qt, QObject, QByteArray, QSize, Signal, QTimer
 from PySide6.QtGui import QColor, QFont, QIcon, QPainter, QPalette, QPixmap
 from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWidgets import (
-    QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QTextEdit, QPushButton, QMessageBox,
 )
 
@@ -358,6 +358,9 @@ class AppUI(QMainWindow):
         self._correction_status_timer.timeout.connect(lambda: self._correction_status_label.clear())
 
         self._current_state = AppState.IDLE
+        # 错误提示复用同一个非模态弹窗（见 show_error），退出走 _quit_app 的一次性闸门
+        self._error_box: QMessageBox | None = None
+        self._quitting = False
 
         # 文本超出可视区域时窗口自动长高（防抖，避免每敲一个字都触发一次布局计算）
         self._resize_debounce = QTimer(self)
@@ -518,7 +521,7 @@ class AppUI(QMainWindow):
         self._capsule = VoiceCapsule(
             on_show_main=self._show_main_window,
             on_stop=self._on_stop,   # 复用现成的手动停止逻辑
-            on_quit=self.close,      # 复用现成的 closeEvent -> controller.shutdown()
+            on_quit=self._quit_app,  # 统一退出入口，见 _quit_app（不能只 close 主窗口）
         )
 
     # ── Public methods (safe to call from any thread via schedule()) ─────────
@@ -634,11 +637,38 @@ class AppUI(QMainWindow):
             self._correction_status_label.setStyleSheet("color: #dc3545;")
 
     def show_error(self, msg: str):
+        """错误提示：非模态、全程只有一个弹窗，新错误只改文案。
+
+        原来直接用 QMessageBox.critical()，它内部 exec() 是"应用级模态 + 嵌套
+        事件循环"。ASR 出故障时错误是成串来的（连接超时 → 服务端报错 → 连接中断，
+        常在 1 秒内全到），后来的错误会在前一个弹窗的嵌套循环里再弹一层，几层叠
+        下去之后应用级模态把本进程所有窗口的输入都挡死：胶囊点不动、主窗口也关
+        不掉，表现就是"整个程序卡死还退不出来"。而且自动模式下主窗口是隐藏的，
+        Wayland 下刚 show 出来的窗口往往抢不到焦点，弹窗可能压根没露面，用户连
+        点哪儿解除模态都不知道。
+        """
         # 自动模式下主窗口平时是收起来的（见 _on_auto_toggled）；出错的时候
         # 把它叫回来再弹提示，不然错误弹窗孤零零跳出来，旁边啥上下文都没有
         if not self.isVisible():
             self._show_main_window()
-        QMessageBox.critical(self, "错误", msg)
+
+        box = self._error_box
+        if box is None:
+            box = QMessageBox(
+                QMessageBox.Icon.Critical, "错误", msg,
+                QMessageBox.StandardButton.Ok, self,
+            )
+            box.setModal(False)
+            box.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+            box.finished.connect(self._on_error_box_finished)
+            self._error_box = box
+        else:
+            box.setText(msg)
+        box.show()
+        box.raise_()
+
+    def _on_error_box_finished(self, _result: int):
+        self._error_box = None
 
     def schedule(self, fn: Callable):
         """Thread-safe: run fn on the Qt main thread via queued signal."""
@@ -767,6 +797,22 @@ class AppUI(QMainWindow):
     # ── Window close ─────────────────────────────────────────────────────────
 
     def closeEvent(self, event):
+        event.accept()
+        self._quit_app()
+
+    def _quit_app(self):
+        """唯一的退出入口（关闭主窗口 / 胶囊右键退出都走这里）。
+
+        不能只 close() 主窗口就指望 Qt 自己退出：Qt 判断"最后一个窗口已关闭"时
+        只排除 ToolTip 和有 transientParent 的窗口，胶囊那种无 parent 的 Qt::Tool
+        顶层窗口照样算数（为什么不挂 parent 见上面 _capsule 处的注释）。主窗口
+        关掉后胶囊还在，lastWindowClosed 就永远不会发，app.exec() 不返回——进程
+        带着麦克风隐形常驻，看着像退干净了其实没有。所以这里显式收掉胶囊 + quit()。
+        """
+        if self._quitting:
+            return
+        self._quitting = True
         if self._controller:
             self._controller.shutdown()
-        event.accept()
+        self._capsule.close()
+        QApplication.quit()
