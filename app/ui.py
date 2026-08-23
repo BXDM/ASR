@@ -553,9 +553,15 @@ class AppUI(QMainWindow):
 
         idle_like = state in (AppState.IDLE, AppState.ERROR)
         active = state in (AppState.LISTENING, AppState.CONNECTING, AppState.RECORDING)
+        # 停止键在除 IDLE 外的所有状态都可点。之前用的是 active，而 STOPPING 既不在
+        # idle_like 也不在 active 里 —— 开始和停止同时变灰，一旦收尾流程卡住（网络
+        # 挂起时 finish() 能卡几秒甚至更久），用户就完全没有自救手段，只能杀进程；
+        # 而残留进程会一直占着 ASR 的并发名额（账号总共才 3 路）。
+        # 现在 STOPPING 下再点一次停止 = 强制中止（见 Controller.stop）。
+        can_stop = state != AppState.IDLE
         self._asr_active = (state == AppState.RECORDING)
         self._btn_start.setEnabled(idle_like)
-        self._btn_stop.setEnabled(active)
+        self._btn_stop.setEnabled(can_stop)
 
         self._waveform.set_active(active)
         self._waveform.set_speaking(state == AppState.RECORDING)
@@ -589,7 +595,23 @@ class AppUI(QMainWindow):
             self._capsule.flash_error()
 
     def _show_main_window(self):
+        self.activate_window()
+
+    def activate_window(self):
+        """把主窗口唤回前台。公开方法——除了胶囊点击，单实例服务收到
+        第二次启动请求时也走这里（见 main.py 的 _serve_single_instance）。
+
+        打开「自动启停」会 hide() 主窗口（见 _on_auto_toggled），此前没有任何
+        办法把它找回来：点 dock 图标只会再起一个新进程，而每个实例都要吃掉一路
+        ASR 并发名额（账号总共只有 3 路）。这个方法就是那条退路。
+        """
         self.showNormal()
+        # Wayland 下合成器经常忽略 activateWindow()，显式清掉最小化位并置活动态，
+        # 最坏情况退化成"任务栏里可以点"，不影响单实例本身的正确性
+        self.setWindowState(
+            (self.windowState() & ~Qt.WindowState.WindowMinimized)
+            | Qt.WindowState.WindowActive
+        )
         self.raise_()
         self.activateWindow()
 
@@ -609,7 +631,7 @@ class AppUI(QMainWindow):
         if correcting:
             self._set_status_text(_CORRECTING_MARKER, _CORRECTING_LABEL, _CORRECTING_COLOR)
         elif self._controller:
-            self.apply_state(self._controller._state)
+            self.apply_state(self._controller.state)
 
     def set_calibrating(self, calibrating: bool):
         """自动模式进入监听后有一小段静默校准噪声基线的过程，专门提示一下——
@@ -617,7 +639,18 @@ class AppUI(QMainWindow):
         if calibrating:
             self._set_status_text("◌", "正在校准环境音，请稍等…", _STATE_COLORS[AppState.LISTENING])
         elif self._controller:
-            self.apply_state(self._controller._state)
+            self.apply_state(self._controller.state)
+
+    def set_retrying(self, retrying: bool):
+        """撞上 ASR 并发配额（账号只有 3 路）时的退避重试提示。
+
+        重试期间麦克风没关、音频也在继续攒，用户其实什么都不用做——但总得让他
+        知道正在发生什么，不然界面停在"连接中"好几秒会以为又卡死了。"""
+        if retrying:
+            self._set_status_text("◌", "服务并发已满，正在重试…",
+                                  _STATE_COLORS[AppState.CONNECTING])
+        elif self._controller:
+            self.apply_state(self._controller.state)
 
     def _set_status_text(self, marker: str, label: str, color: str):
         # 圆点后面留一点呼吸感，一个空格太紧
@@ -792,7 +825,7 @@ class AppUI(QMainWindow):
 
     def _restore_status_after_copy(self):
         if self._controller:
-            self.apply_state(self._controller._state)
+            self.apply_state(self._controller.state)
 
     # ── Window close ─────────────────────────────────────────────────────────
 

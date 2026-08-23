@@ -4,3 +4,6 @@ websocket-client==1.9.0
 PyYAML==6.0.3
 pyperclip==1.11.0
 numpy==2.2.6
+
+# 可选：仅当 config.yaml 里 correction.backend = "local" 时才需要
+# llama-cpp-python>=0.3

@@ -337,8 +337,16 @@ class VoiceCapsule(QWidget):
 
     def _on_error_timeout(self):
         self._error_active = False
-        self._pending_visual = None
-        self.hide()
+        # 跟 _on_copy_timeout 一样要把挂起的状态放出来，不能直接丢掉：
+        # 出错闪烁会锁存 2 秒，用户在这 2 秒内重新点开始的话，新状态（小圆点/波形）
+        # 会被 _set_visual 存进 _pending_visual；丢掉它就等于胶囊再也不出现了，
+        # 而自动模式下 LISTENING 可能几分钟不变状态，主窗口通常又是隐藏的——
+        # 用户会彻底失去"程序还在录音"的唯一可见指示。
+        pending, self._pending_visual = self._pending_visual, None
+        if pending is not None:
+            self._apply_visual(pending)
+        else:
+            self.hide()
 
     def _reposition(self):
         # 尺寸随时都要跟着 easing 走——resize() 在 X11/Wayland 下都正常生效，

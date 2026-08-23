@@ -10,8 +10,10 @@
 
 import logging
 import threading
+from typing import TYPE_CHECKING
 
-from llama_cpp import Llama
+if TYPE_CHECKING:                     # 仅供类型标注，运行时不导入
+    from llama_cpp import Llama
 
 logger = logging.getLogger(__name__)
 
@@ -40,7 +42,7 @@ class LocalQwenCorrector:
         self._n_threads = n_threads
         self._n_gpu_layers = n_gpu_layers
 
-        self._llm: Llama | None = None
+        self._llm: "Llama | None" = None
         self.state = "UNLOADED"
         self._lock = threading.Lock()
         self._ready_event = threading.Event()
@@ -53,6 +55,12 @@ class LocalQwenCorrector:
             self.state = "LOADING"
 
         try:
+            # 延迟到这里才导入：llama-cpp-python 是个可选的重量级依赖，不在
+            # requirements.txt 里。放在模块顶层的话，即使 config.yaml 里
+            # correction.enabled 是 false，main.py 的 import 链也会一路炸到
+            # ModuleNotFoundError，整个应用直接起不来。
+            from llama_cpp import Llama
+
             llm = Llama(
                 model_path=self._model_path,
                 n_ctx=self._n_ctx,
