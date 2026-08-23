@@ -174,6 +174,15 @@ class WaveformWidget(QWidget):
         total_w = self._NUM_BARS * self._BAR_W + (self._NUM_BARS - 1) * self._GAP
         self.setFixedSize(total_w + 24, self._MAX_H + 12)
 
+        # 让 Qt 每次重绘前先把本控件矩形擦成窗口背景色。
+        # 不加这句会出现"波形位置凭空多出半个方框"：paintEvent 在空闲态什么都不画
+        # 就 return，而竖条即使在录音态也只覆盖中间一小块，边缘从来没人碰。控件又
+        # 没有 autoFillBackground / WA_OpaquePaintEvent，Qt 便不替它擦除——于是
+        # _adjust_window_height 动态 resize 窗口时，backing store 被 blit 搬进来的
+        # 残留像素（多半是文本框那条 1px 边框）就永久留在这块区域上。
+        # 填充色取自 palette 的 Window 角色，跟父控件背景一致，视觉上没有任何变化。
+        self.setAutoFillBackground(True)
+
         self._phases = [i * (2 * math.pi / self._NUM_BARS) for i in range(self._NUM_BARS)]
 
         self._amp_target  = 0.0
