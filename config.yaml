@@ -11,8 +11,8 @@ app:
 asr:
   app_id: "7938041955"
   access_key: ""
-  resource_id: "volc.bigasr.sauc.duration"   # 1.0 小时版；2.0 用 volc.seedasr.sauc.duration
-  ws_url: "wss://openspeech.bytedance.com/api/v3/sauc/bigmodel"
+  resource_id: "volc.seedasr.sauc.duration"  # 豆包流式语音识别 2.0 小时版（该账号未开通 1.0）
+  ws_url: "wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_async"
 
 correction:
   enabled: false                             # 停止后是否自动跑一次 AI 校正

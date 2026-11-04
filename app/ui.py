@@ -30,6 +30,20 @@ from app.state import AppState
 from app.clipboard_util import copy_to_clipboard
 from app.voice_capsule import VoiceCapsule
 
+# Ubuntu 上 Qt 界面字大约 11pt，状态栏和识别结果在此基础上用 13pt（大 2pt）。
+# Windows 默认是微软雅黑 9pt。若这两处仍写死 13pt，会比按钮大出一截。
+# 只改字号、不改字体族：Windows 继续用微软雅黑，Ubuntu 继续用桌面字体。
+_CONTENT_PT_OVER_CHROME = 2
+
+
+def content_font() -> QFont:
+    font = QFont(QApplication.font())
+    chrome = font.pointSize()
+    if chrome <= 0:
+        chrome = 9
+    font.setPointSize(chrome + _CONTENT_PT_OVER_CHROME)
+    return font
+
 if TYPE_CHECKING:
     from app.controller import Controller
 
@@ -391,8 +405,7 @@ class AppUI(QMainWindow):
         status_row.setContentsMargins(0, 0, 0, 0)
         status_row.setSpacing(8)
 
-        status_font = QFont()
-        status_font.setPointSize(13)
+        status_font = content_font()
 
         self._status_label = QLabel()
         self._status_label.setTextFormat(Qt.TextFormat.RichText)
@@ -427,9 +440,7 @@ class AppUI(QMainWindow):
             "}"
         )
         self._text_area.setCursorWidth(2)
-        text_font = QFont()
-        text_font.setPointSize(13)
-        self._text_area.setFont(text_font)
+        self._text_area.setFont(content_font())
         self._text_area.setLineWrapMode(QTextEdit.LineWrapMode.WidgetWidth)
         self._text_area.textChanged.connect(self._on_text_changed)
         root.addWidget(self._text_area, stretch=1)
