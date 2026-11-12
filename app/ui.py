@@ -785,6 +785,7 @@ class AppUI(QMainWindow):
             return
         if copy_to_clipboard(text):
             self._show_copied_feedback("已复制！")
+            self._controller.learn_from_accepted()   # 采纳 → 触发静默学习
 
     def auto_copy(self, text: str):
         """自动模式静音自动停止后，免去用户再手动点一次「复制」——
@@ -793,6 +794,8 @@ class AppUI(QMainWindow):
             return
         if copy_to_clipboard(text):
             self._show_copied_feedback("已自动复制到剪贴板")
+            if self._controller:
+                self._controller.learn_from_accepted()   # 采纳 → 触发静默学习
             if self._auto_toggle.isChecked():
                 self._capsule.flash_copied()
 

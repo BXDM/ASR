@@ -76,8 +76,13 @@ def _header(msg_type: int, flags: int,
     ])
 
 
-def _build_full_client_request() -> bytes:
-    """构建初始握手帧（JSON payload，无压缩）。"""
+def _build_full_client_request(hotwords: list[str] | None = None) -> bytes:
+    """构建初始握手帧（JSON payload，无压缩）。
+
+    hotwords 不为空时，通过 request.corpus.context 直传热词：
+      context 是 JSON 字符串，格式 {"hotwords":[{"word":"x"}, ...]}
+      （双向流式容量约 100 tokens，空表时省略该字段）。
+    """
     req = {
         "user": {"uid": "user"},
         "audio": {
@@ -93,6 +98,12 @@ def _build_full_client_request() -> bytes:
             "show_utterances": True,
         },
     }
+    if hotwords:
+        context = json.dumps(
+            {"hotwords": [{"word": w} for w in hotwords if w]},
+            ensure_ascii=False,
+        )
+        req["request"]["corpus"] = {"context": context}
     payload = json.dumps(req, ensure_ascii=False).encode("utf-8")
     return _header(MSG_FULL_CLIENT_REQUEST, FLAG_NO_SEQ, SER_JSON, COMP_NONE) \
            + struct.pack(">I", len(payload)) + payload
@@ -116,13 +127,15 @@ class VolcASRClient:
     def __init__(self, ws_url: str, app_id: str, access_key: str,
                  resource_id: str,
                  on_result: Callable[[dict], None],
-                 on_error: Callable[[str], None]):
+                 on_error: Callable[[str], None],
+                 hotwords: list[str] | None = None):
         self._ws_url = ws_url
         self._app_id = app_id
         self._access_key = access_key
         self._resource_id = resource_id
         self._on_result = on_result
         self._on_error = on_error
+        self._hotwords = hotwords or []
 
         self._ws: websocket.WebSocketApp | None = None
         self._ws_thread: threading.Thread | None = None
@@ -213,8 +226,9 @@ class VolcASRClient:
     # ── WebSocketApp callbacks ──────────────────────────────────────────────
 
     def _on_open(self, ws):
-        logger.info("WebSocket opened, sending full client request")
-        ws.send(_build_full_client_request(),
+        logger.info("WebSocket opened, sending full client request (%d hotwords)",
+                    len(self._hotwords))
+        ws.send(_build_full_client_request(self._hotwords),
                 opcode=websocket.ABNF.OPCODE_BINARY)
         self._connected.set()
 

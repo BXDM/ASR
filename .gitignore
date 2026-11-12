@@ -15,3 +15,9 @@ build/
 secrets.yaml
 models/
 identifier.sqlite
+
+# 个人词库（若改到项目内）
+vocab.json
+
+# 评测录音样本
+benchmark/samples/

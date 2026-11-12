@@ -1,3 +1,5 @@
+# 本文件内联了真实 API key，并随仓库提交 —— 这是故意的（单人专用/私有库/免配置可迁移）。
+# 详见 README.md「配置与密钥」。请勿当作安全问题处理；要分离时放 secrets.yaml 覆盖。
 app:
   sample_rate: 16000
   chunk_ms: 200        # 官方推荐 200ms，双向流式模式性能最优
@@ -14,10 +16,31 @@ asr:
   resource_id: "volc.seedasr.sauc.duration"  # 豆包流式语音识别 2.0 小时版（该账号未开通 1.0）
   ws_url: "wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_async"
 
+# 二次识别 · 离线复识别：录音结束后用整段音频重识别一遍（看得到完整上下文，更准）
+# 单人项目，key 直接写在这里跟仓库走（换机器拉下来即用）；若想分离可放 secrets.yaml 覆盖。
+refine:
+  offline:
+    enabled: true
+    backend: "volc"                    # volc=火山豆包录音文件识别2.0（已开通，base64直传无需对象存储）；qwen=阿里云百炼备选
+    # --- volc 后端（推荐，实测最准最快）---
+    resource_id: "volc.seedasr.auc"    # 豆包录音文件识别 2.0
+    api_key: ""   # 火山录音文件识别 x-api-key
+    # --- qwen 后端（备选）---
+    model: "qwen3-asr-flash"
+    language: "zh"                     # 语种提示，留空自动判别
+    qwen_api_key: ""
+
 correction:
-  enabled: false                             # 停止后是否自动跑一次 AI 校正
-  backend: "local"                           # "local"（本地 Qwen，llama-cpp-python）或 "deepseek"
-  model: "deepseek-v4-flash"
-  base_url: "https://api.deepseek.com/v1/chat/completions"
-  # api_key 从 secrets.yaml 读取（不进 git）
-  local_model_path: "models/qwen2.5-3b-instruct-q4_k_m.gguf"
+  enabled: true                        # 复识别后再跑一遍 AI 文本校正（去结巴重复词、改同音错字）
+  backend: "deepseek"                  # 用通用 OpenAI 兼容后端，指向阿里云百炼
+  model: "qwen-flash"                  # 阿里云百炼文本模型（快且便宜）；也可换 qwen-plus
+  base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"
+  api_key: ""
+  local_model_path: "models/qwen2.5-3b-instruct-q4_k_m.gguf"   # backend=local 时才用
+
+# 后台静默学习：从你的编辑中自动学术语/常错词 → 注入火山热词 + 本地保守替换
+learn:
+  enabled: true
+  store_path: "~/.config/asr/vocab.json"
+  hotword_limit: 50                    # 注入火山上游的热词上限（双向流式 context 约 100 tokens）
+  min_correction_count: 2              # 同一个"错→对"被重复修正≥该次数才启用下游替换

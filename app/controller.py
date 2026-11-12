@@ -21,7 +21,16 @@ from audio.recorder import MicRecorder
 from asr.volc_client import VolcASRClient
 from utils.text_buffer import TextBuffer
 from correction.corrector import DeepSeekCorrector
-from correction.local_corrector import LocalQwenCorrector
+try:
+    # 本地 GGUF 校正器依赖 llama-cpp-python；只有 backend=local 才需要。
+    # 懒导入失败不影响其它后端（deepseek / 阿里云兼容端点）正常启动。
+    from correction.local_corrector import LocalQwenCorrector
+except Exception:   # pragma: no cover - 环境没装 llama_cpp 时
+    LocalQwenCorrector = None
+from learn.store import VocabStore
+from learn.miner import mine_corrections, extract_terms
+from refine.qwen import QwenRecognizer
+from refine.offline import VolcFlashRecognizer
 
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -55,8 +64,51 @@ class Controller:
 
         # 校正器：本地模型是应用级单例，启动时立即创建并在后台线程 load()，
         # 之后一直驻留到程序退出（见 _init_corrector / shutdown）。
-        self._corrector: DeepSeekCorrector | LocalQwenCorrector | None = None
+        self._corrector = None   # DeepSeekCorrector | LocalQwenCorrector | None
         self._init_corrector()
+
+        # ── 静默学习 + 二次识别（离线复识别）─────────────────────────────────
+        sr = config.get("app", {}).get("sample_rate", 16000)
+
+        learn_cfg = (config.get("learn") or {})
+        self._vocab: VocabStore | None = None
+        if learn_cfg.get("enabled", True):
+            try:
+                self._vocab = VocabStore(
+                    path=learn_cfg.get("store_path", "~/.config/asr/vocab.json"),
+                    min_correction_count=learn_cfg.get("min_correction_count", 2),
+                    hotword_limit=learn_cfg.get("hotword_limit", 50),
+                )
+            except Exception as e:
+                logger.warning("vocab store init failed, learning disabled: %s", e)
+
+        off_cfg = ((config.get("refine") or {}).get("offline") or {})
+        self._offline = None   # VolcFlashRecognizer | QwenRecognizer | None
+        if off_cfg.get("enabled", False):
+            backend = off_cfg.get("backend", "volc")
+            try:
+                if backend == "volc":
+                    rec = VolcFlashRecognizer(
+                        api_key=off_cfg.get("api_key", ""),
+                        resource_id=off_cfg.get("resource_id", "volc.seedasr.auc"),
+                        sample_rate=sr,
+                    )
+                else:  # qwen
+                    rec = QwenRecognizer(
+                        api_key=off_cfg.get("qwen_api_key") or off_cfg.get("api_key", ""),
+                        model=off_cfg.get("model", "qwen3-asr-flash"),
+                        language=off_cfg.get("language") or None,
+                        sample_rate=sr,
+                    )
+                self._offline = rec if rec.enabled else None
+                if not self._offline:
+                    logger.warning("离线复识别(%s) 未配 api_key，已跳过", backend)
+            except Exception as e:
+                logger.warning("offline recognizer init failed: %s", e)
+
+        self._pcm_buf = bytearray()          # 录音期缓存整段 PCM，供离线复识别
+        self._session_baseline = ""          # 展示给用户的最终文本，作为学习 diff 基线
+        self._active_repl: dict[str, str] = {}   # 本次会话的下游替换表快照
 
         # ── 自动启停（VAD）相关状态 ─────────────────────────────────────────
         vad_cfg = config.get("app", {}).get("vad", {})
@@ -126,7 +178,7 @@ class Controller:
         """程序退出前调用：停止录音，并释放常驻的本地校正模型。
         普通的录音结束/窗口最小化/切页面都不应触发这个——只有整个进程退出时才调用。"""
         self.stop()
-        if isinstance(self._corrector, LocalQwenCorrector):
+        if LocalQwenCorrector is not None and isinstance(self._corrector, LocalQwenCorrector):
             self._corrector.close()
 
     def clear(self):
@@ -166,6 +218,9 @@ class Controller:
     def _reset_session(self):
         self._committed_text = ""
         self._current_text = ""
+        self._pcm_buf = bytearray()
+        self._session_baseline = ""
+        self._active_repl = self._vocab.active_replacements() if self._vocab else {}
         self._buffer.clear()
 
     def _open_mic(self) -> bool:
@@ -229,8 +284,9 @@ class Controller:
         auto_copy = self._auto_stop_pending
         self._auto_stop_pending = False
 
-        if not self._maybe_run_correction(auto_copy):
-            # 没有跑校正（未启用/没装好/没内容）：文本已经是最终结果，直接复制
+        if not self._maybe_run_second_pass(auto_copy):
+            # 没有二次识别（都未启用/没内容）：文本已是最终结果，直接复制
+            self._session_baseline = self._committed_text
             if auto_copy:
                 self._auto_copy_result()
 
@@ -273,6 +329,79 @@ class Controller:
         threading.Thread(target=self._run_correction, args=(text, auto_copy), daemon=True).start()
         return True
 
+    # ── 二次识别（离线复识别 → AI 校正）+ 静默学习 ───────────────────────────
+
+    def _maybe_run_second_pass(self, auto_copy: bool = False) -> bool:
+        """录音结束后起一条后台流水线：Qwen 离线复识别 → 现有 AI 校正。
+        返回是否真的起了后台线程（决定自动复制现在做还是等流水线跑完）。"""
+        text = self._committed_text.strip()
+        if not text:
+            return False
+        corr_on = bool(self._cfg.get("correction", {}).get("enabled")) and self._corrector is not None
+        off_on = self._offline is not None
+        if not corr_on and not off_on:
+            return False
+        pcm = bytes(self._pcm_buf)
+        threading.Thread(target=self._second_pass_worker,
+                         args=(text, pcm, auto_copy, corr_on), daemon=True).start()
+        return True
+
+    def _second_pass_worker(self, original_text: str, pcm: bytes,
+                            auto_copy: bool, corr_on: bool):
+        base = original_text
+        # 1) Qwen 离线复识别（整段音频重识别，看得到完整上下文）
+        if self._offline and pcm:
+            self._ui.schedule(lambda: self._ui.set_correcting(True))
+            try:
+                off = self._apply_corrections((self._offline.recognize(pcm) or "").strip())
+            except Exception as e:
+                logger.warning("qwen 离线复识别失败: %s", e)
+                off = ""
+            finally:
+                self._ui.schedule(lambda: self._ui.set_correcting(False))
+            # 仅当会话没被清空/重开时才套用
+            if off and self._committed_text.strip() == base:
+                self._committed_text = off
+                self._buffer.set_text(off)
+                self._ui.schedule(lambda t=off: self._ui.set_text(t, force=True))
+                base = off
+        # 2) 现有 AI 文本校正（在复识别结果上再纠一遍；内部负责 auto_copy）
+        if corr_on:
+            self._run_correction(self._committed_text.strip(), auto_copy)
+        elif auto_copy:
+            self._auto_copy_result()
+        # 3) 学习基线 = 用户将看到并编辑的最终文本
+        self._session_baseline = self._committed_text
+
+    def _apply_corrections(self, text: str) -> str:
+        """下游保守替换：用本次会话快照的替换表纠正已学会的错字。"""
+        if not self._active_repl or not text:
+            return text
+        for wrong, right in self._active_repl.items():
+            if wrong in text:
+                text = text.replace(wrong, right)
+        return text
+
+    def learn_from_accepted(self):
+        """用户采纳文本（手动/自动复制）时调用：后台静默挖掘纠正对与候选热词。"""
+        if not self._vocab:
+            return
+        baseline = self._session_baseline
+        final = self._ui.get_text().strip()
+        if not baseline or not final:
+            return
+        threading.Thread(target=self._learn_worker,
+                         args=(baseline, final), daemon=True).start()
+
+    def _learn_worker(self, baseline: str, final: str):
+        try:
+            for wrong, right in mine_corrections(baseline, final):
+                self._vocab.record_correction(wrong, right)
+            self._vocab.record_terms(extract_terms(final))
+            self._vocab.commit()
+        except Exception as e:
+            logger.warning("silent-learn error: %s", e)
+
     def _auto_copy_result(self):
         text = self._committed_text.strip()
         if text:
@@ -288,6 +417,9 @@ class Controller:
         backend = corr_cfg.get("backend", "deepseek")
         try:
             if backend == "local":
+                if LocalQwenCorrector is None:
+                    logger.warning("backend=local 但未安装 llama-cpp-python，本地校正不可用")
+                    return
                 model_path = corr_cfg.get("local_model_path", "")
                 if not os.path.isabs(model_path):
                     model_path = os.path.join(_PROJECT_ROOT, model_path)
@@ -321,7 +453,7 @@ class Controller:
                 self._auto_copy_result()
             return
 
-        if isinstance(corrector, LocalQwenCorrector) and corrector.state != "READY":
+        if LocalQwenCorrector is not None and isinstance(corrector, LocalQwenCorrector) and corrector.state != "READY":
             if corrector.state == "FAILED":
                 self._ui.schedule(lambda: self._ui.set_correction_status("failed"))
                 if auto_copy:
@@ -411,6 +543,7 @@ class Controller:
 
             elif state == AppState.RECORDING:
                 if self._asr:
+                    self._pcm_buf.extend(pcm)   # 缓存整段音频供离线复识别
                     self._asr.send_audio(pcm)
 
                 if self._auto_vad:
@@ -468,6 +601,7 @@ class Controller:
             resource_id=asr_cfg["resource_id"],
             on_result=guarded_result,
             on_error=guarded_error,
+            hotwords=self._vocab.hotwords() if self._vocab else [],
         )
 
         try:
@@ -491,6 +625,7 @@ class Controller:
             # 之前发完，否则会和音频线程后续实时帧的发送顺序乱掉（见并发设计说明）
             inflight, self._inflight = self._inflight, []
             for chunk in inflight:
+                self._pcm_buf.extend(chunk)   # 复识别也要包含开口前的预录音
                 try:
                     new_asr.send_audio(chunk)
                 except Exception:
@@ -523,6 +658,7 @@ class Controller:
             resource_id=asr_cfg["resource_id"],
             on_result=guarded_result,
             on_error=guarded_error,
+            hotwords=self._vocab.hotwords() if self._vocab else [],
         )
         try:
             new_asr.connect()
@@ -561,7 +697,7 @@ class Controller:
     # ── ASR callbacks (called from ASR background thread) ───────────────────
 
     def _on_asr_result(self, result: dict):
-        text = result["text"]
+        text = self._apply_corrections(result["text"])
         self._current_text = text
         if self._committed_text:
             display = self._committed_text + "\n" + text
