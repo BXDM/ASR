@@ -31,6 +31,7 @@ from learn.store import VocabStore
 from learn.miner import mine_corrections, extract_terms
 from refine.qwen import QwenRecognizer
 from refine.offline import VolcFlashRecognizer
+from compose.email import EmailDrafter
 
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -61,6 +62,10 @@ class Controller:
         # 每次重新建立 ASR 连接（含清空/编辑触发的重连）都会自增。
         # 用于过滤"旧连接关闭前残留的回调"，避免清空/编辑后旧文本又跑回来。
         self._asr_generation = 0
+
+        # 每次会话复位（_reset_session）自增。后台「复识别+AI校正」流水线启动时
+        # 快照本代号，回写结果前校验；不一致说明已切到新一轮，直接丢弃本次结果。
+        self._session_gen = 0
 
         # 校正器：本地模型是应用级单例，启动时立即创建并在后台线程 load()，
         # 之后一直驻留到程序退出（见 _init_corrector / shutdown）。
@@ -109,6 +114,27 @@ class Controller:
         self._pcm_buf = bytearray()          # 录音期缓存整段 PCM，供离线复识别
         self._session_baseline = ""          # 展示给用户的最终文本，作为学习 diff 基线
         self._active_repl: dict[str, str] = {}   # 本次会话的下游替换表快照
+
+        # ── 邮件模式 ────────────────────────────────────────────────────────
+        # 勾选后，录音结束不再只做「转写校正」，而是把口述内容交给 DeepSeek，
+        # 以采购主管口吻直接生成一封邮件、替换显示文本。复用 correction 段的
+        # DeepSeek key/模型/端点（与 AI 校正同一个账号）。
+        self._email_mode = False
+        self._email_drafter: EmailDrafter | None = None
+        corr_cfg = config.get("correction", {})
+        email_cfg = ((config.get("compose") or {}).get("email") or {})
+        if corr_cfg.get("api_key"):
+            try:
+                # 邮件追求质量：优先用 compose.email.model（DeepSeek 最强），
+                # 没配才回退到 correction 的快模型。key/端点与校正共用同一 DeepSeek 账号。
+                self._email_drafter = EmailDrafter(
+                    api_key=corr_cfg["api_key"],
+                    model=email_cfg.get("model") or corr_cfg.get("model", "deepseek-chat"),
+                    base_url=corr_cfg.get("base_url",
+                                          "https://api.deepseek.com/v1/chat/completions"),
+                )
+            except Exception as e:
+                logger.warning("email drafter init failed: %s", e)
 
         # ── 自动启停（VAD）相关状态 ─────────────────────────────────────────
         vad_cfg = config.get("app", {}).get("vad", {})
@@ -174,6 +200,10 @@ class Controller:
         """切换自动启停开关（下次 start() 生效，进行中的会话不受影响）。"""
         self._auto_vad = enabled
 
+    def set_email_mode(self, enabled: bool):
+        """切换邮件模式：开启后录音结束把口述内容生成为邮件（见 _second_pass_worker）。"""
+        self._email_mode = enabled
+
     def shutdown(self):
         """程序退出前调用：停止录音，并释放常驻的本地校正模型。
         普通的录音结束/窗口最小化/切页面都不应触发这个——只有整个进程退出时才调用。"""
@@ -216,6 +246,11 @@ class Controller:
     # ── Recording session ────────────────────────────────────────────────────
 
     def _reset_session(self):
+        # 自动模式每轮停顿收尾后会立刻复位进入下一句，但上一句的「复识别+AI校正」
+        # 后台流水线可能还在跑（网络 ~2s）。自增会话代号作废那条在途流水线：
+        # 它跑完回写前会校验代号，不一致就丢弃，避免把上一句的结果（甚至因竞态
+        # 读到空串而产生的 LLM 闲聊回复）污染到已经复位的新一轮里。
+        self._session_gen += 1
         self._committed_text = ""
         self._current_text = ""
         self._pcm_buf = bytearray()
@@ -339,7 +374,9 @@ class Controller:
             return False
         corr_on = bool(self._cfg.get("correction", {}).get("enabled")) and self._corrector is not None
         off_on = self._offline is not None
-        if not corr_on and not off_on:
+        email_on = self._email_mode and self._email_drafter is not None and self._email_drafter.enabled
+        # 邮件模式即使关了复识别/校正也要起流水线（它负责把口述生成邮件）
+        if not corr_on and not off_on and not email_on:
             return False
         pcm = bytes(self._pcm_buf)
         threading.Thread(target=self._second_pass_worker,
@@ -348,7 +385,11 @@ class Controller:
 
     def _second_pass_worker(self, original_text: str, pcm: bytes,
                             auto_copy: bool, corr_on: bool):
+        import time
+        t0 = time.monotonic()
+        gen = self._session_gen            # 快照会话代号，回写前据此作废过期流水线
         base = original_text
+        logger.info("[STAGE streaming ] %r", original_text)
         # 1) Qwen 离线复识别（整段音频重识别，看得到完整上下文）
         if self._offline and pcm:
             self._ui.schedule(lambda: self._ui.set_correcting(True))
@@ -359,19 +400,57 @@ class Controller:
                 off = ""
             finally:
                 self._ui.schedule(lambda: self._ui.set_correcting(False))
-            # 仅当会话没被清空/重开时才套用
-            if off and self._committed_text.strip() == base:
+            logger.info("[STAGE refined   ] (+%.2fs, pcm=%.1fs) %r",
+                        time.monotonic() - t0, len(pcm) / 2 / 16000, off)
+            # 仅当会话没被清空/重开（代号一致）且当前文本仍是本次基线时才套用
+            if off and gen == self._session_gen and self._committed_text.strip() == base:
                 self._committed_text = off
                 self._buffer.set_text(off)
                 self._ui.schedule(lambda t=off: self._ui.set_text(t, force=True))
                 base = off
-        # 2) 现有 AI 文本校正（在复识别结果上再纠一遍；内部负责 auto_copy）
-        if corr_on:
-            self._run_correction(self._committed_text.strip(), auto_copy)
+        # 2) 邮件模式优先：把口述内容（经复识别的 base）生成为邮件，替换显示文本，
+        #    不再走「转写校正」那条路——这一步是二次创作，不是逐字纠错。
+        if (self._email_mode and self._email_drafter is not None
+                and self._email_drafter.enabled and base.strip()):
+            self._compose_email(base, auto_copy, gen)
+        # 3) 否则走 AI 文本校正：传入本次快照 base（不要再读可能已被复位的
+        #    _committed_text，否则竞态下会把空串发给 LLM，拿回闲聊回复）
+        elif corr_on and base.strip():
+            self._run_correction(base, auto_copy, gen)
         elif auto_copy:
             self._auto_copy_result()
-        # 3) 学习基线 = 用户将看到并编辑的最终文本
-        self._session_baseline = self._committed_text
+        # 4) 学习基线 = 用户将看到并编辑的最终文本（仍属本轮才更新）
+        if gen == self._session_gen:
+            self._session_baseline = self._committed_text
+
+    def _compose_email(self, source_text: str, auto_copy: bool, gen: int):
+        """后台线程内调用：口述内容 → DeepSeek 采购主管邮件，替换显示文本。"""
+        self._ui.schedule(lambda: self._ui.set_correcting(True))
+        try:
+            import time
+            _t = time.monotonic()
+            try:
+                email = self._email_drafter.compose(source_text).strip()
+            except Exception as e:
+                logger.warning("邮件生成失败: %s", e)
+                if auto_copy:
+                    self._auto_copy_result()
+                return
+            logger.info("[STAGE email     ] (+%.2fs) %r", time.monotonic() - _t, email)
+            if not email:
+                if auto_copy:
+                    self._auto_copy_result()
+                return
+            # 会话已切到新一轮：本次结果过期，丢弃不回写
+            if gen != self._session_gen:
+                return
+            self._committed_text = email
+            self._buffer.set_text(email)
+            self._ui.schedule(lambda t=email: self._ui.set_text(t, force=True))
+        finally:
+            self._ui.schedule(lambda: self._ui.set_correcting(False))
+            if auto_copy:
+                self._auto_copy_result()
 
     def _apply_corrections(self, text: str) -> str:
         """下游保守替换：用本次会话快照的替换表纠正已学会的错字。"""
@@ -445,10 +524,22 @@ class Controller:
         status = "ready" if corrector.state == "READY" else "failed"
         self._ui.schedule(lambda s=status: self._ui.set_correction_status(s))
 
-    def _run_correction(self, original_text: str, auto_copy: bool = False):
-        """后台线程：调用 AI 校正接口，修正重复词/明显误听词并直接替换显示文本。"""
+    def _run_correction(self, original_text: str, auto_copy: bool = False,
+                        gen: int | None = None):
+        """后台线程：调用 AI 校正接口，修正重复词/明显误听词并直接替换显示文本。
+
+        gen：调用方（二次识别流水线）启动时快照的会话代号。回写结果前校验，
+        不一致说明已切到新一轮，丢弃本次结果。None 表示不校验（遗留调用方）。
+        """
         corrector = self._corrector
         if corrector is None:
+            if auto_copy:
+                self._auto_copy_result()
+            return
+
+        # 空串守卫：绝不把空/纯空白文本发给 LLM——否则模型会把它当成「没给内容」，
+        # 回一句「请提供需要校对的文本」之类的闲聊，污染显示文本。
+        if not original_text.strip():
             if auto_copy:
                 self._auto_copy_result()
             return
@@ -469,13 +560,20 @@ class Controller:
 
         self._ui.schedule(lambda: self._ui.set_correcting(True))
         try:
+            import time
+            _t = time.monotonic()
             try:
                 corrected = corrector.correct(original_text).strip()
             except Exception as e:
                 logger.warning("AI 校正失败: %s", e)
                 return
 
+            logger.info("[STAGE corrected ] (+%.2fs) %r", time.monotonic() - _t, corrected)
             if not corrected or corrected == original_text:
+                return
+
+            # 会话已切到新一轮（自动模式复位）：本次结果过期，丢弃不回写
+            if gen is not None and gen != self._session_gen:
                 return
 
             # 校正期间用户可能已经清空/重新开始录音，这时旧结果就不该再套用了

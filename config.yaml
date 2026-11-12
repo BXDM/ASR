@@ -32,11 +32,17 @@ refine:
 
 correction:
   enabled: true                        # 复识别后再跑一遍 AI 文本校正（去结巴重复词、改同音错字）
-  backend: "deepseek"                  # 用通用 OpenAI 兼容后端，指向阿里云百炼
-  model: "qwen-flash"                  # 阿里云百炼文本模型（快且便宜）；也可换 qwen-plus
-  base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"
-  api_key: ""
+  backend: "deepseek"                  # AI 文本校正走 DeepSeek 原生端点（千问只用于语音识别，不用于文本校正）
+  model: "deepseek-chat"               # = deepseek-flash（V4.1-Flash），校正只去重去错字，用快且便宜的即可
+  base_url: "https://api.deepseek.com/v1/chat/completions"
+  api_key: ""   # DeepSeek 原生 key
   local_model_path: "models/qwen2.5-3b-instruct-q4_k_m.gguf"   # backend=local 时才用
+
+# 邮件模式：把口述内容改写成邮件正文（采购主管口吻）。复用 correction 的 DeepSeek key/端点，
+# 但用更强的模型追求质量（OpenAI 无法付款，故统一走 DeepSeek 最好的模型）。
+compose:
+  email:
+    model: "deepseek-v4-pro"           # DeepSeek 最强模型；留空则回退用 correction.model
 
 # 后台静默学习：从你的编辑中自动学术语/常错词 → 注入火山热词 + 本地保守替换
 learn:

@@ -10,8 +10,12 @@
 
 import logging
 import threading
+from typing import TYPE_CHECKING
 
-from llama_cpp import Llama
+# llama-cpp-python 是可选依赖（不在 requirements.txt），只在真正加载本地模型时才导入，
+# 这样没装它时程序也能正常启动（correction.enabled=false 或使用 deepseek 后端）。
+if TYPE_CHECKING:
+    from llama_cpp import Llama
 
 logger = logging.getLogger(__name__)
 
@@ -40,7 +44,7 @@ class LocalQwenCorrector:
         self._n_threads = n_threads
         self._n_gpu_layers = n_gpu_layers
 
-        self._llm: Llama | None = None
+        self._llm: "Llama | None" = None
         self.state = "UNLOADED"
         self._lock = threading.Lock()
         self._ready_event = threading.Event()
@@ -53,6 +57,7 @@ class LocalQwenCorrector:
             self.state = "LOADING"
 
         try:
+            from llama_cpp import Llama
             llm = Llama(
                 model_path=self._model_path,
                 n_ctx=self._n_ctx,

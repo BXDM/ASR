@@ -7,7 +7,7 @@ from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import QApplication
 
 from utils.config_loader import load_config
-from app.ui import AppUI
+from app.ui import AppUI, apply_windows_appearance
 from app.controller import Controller
 
 logging.basicConfig(
@@ -33,6 +33,7 @@ def main():
     config = load_config()
 
     app = QApplication(sys.argv)
+    apply_windows_appearance(app)
     app.setApplicationName("语音转文字")
     app.setDesktopFileName(_APP_USER_MODEL_ID)   # 匹配 asr-voice.desktop，使 dock 能识别并固定
     if _ICON.exists():

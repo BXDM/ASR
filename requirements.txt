@@ -5,3 +5,4 @@ PyYAML==6.0.3
 pyperclip==1.11.0
 numpy==2.2.6
 dashscope>=1.20.0   # 千问离线复识别（refine/qwen.py）；AI 校正走 HTTP，不依赖它
+cryptography>=43.0.0   # 加密凭据包 security/secrets.enc（Fernet 认证加密）

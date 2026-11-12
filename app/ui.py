@@ -16,10 +16,14 @@ Layout:
 """
 
 import math
+import sys
 from typing import Callable, TYPE_CHECKING
 
-from PySide6.QtCore import Qt, QObject, QByteArray, QSize, Signal, QTimer
-from PySide6.QtGui import QColor, QFont, QIcon, QPainter, QPalette, QPixmap
+from PySide6.QtCore import Qt, QObject, QByteArray, QRectF, QSize, Signal, QTimer
+from PySide6.QtGui import (
+    QColor, QFont, QFontMetrics, QIcon, QPainter, QPalette, QPen, QPixmap,
+    QTextBlockFormat, QTextCursor,
+)
 from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -31,9 +35,14 @@ from app.clipboard_util import copy_to_clipboard
 from app.voice_capsule import VoiceCapsule
 
 # Ubuntu 上 Qt 界面字大约 11pt，状态栏和识别结果在此基础上用 13pt（大 2pt）。
-# Windows 默认是微软雅黑 9pt。若这两处仍写死 13pt，会比按钮大出一截。
-# 只改字号、不改字体族：Windows 继续用微软雅黑，Ubuntu 继续用桌面字体。
+# Windows 默认是微软雅黑 9pt。apply_windows_appearance() 会先把界面字抬到 11pt，
+# 这两处再 +2pt，和 Ubuntu 对齐。不要在这里写死 13pt——按钮还是界面字号，
+# 正文单独写死会比按钮大出一截。只改字号、不改字体族。
 _CONTENT_PT_OVER_CHROME = 2
+_UBUNTU_CHROME_PT = 11
+
+# 识别结果文本框的行距：每行在字体自身高度基础上再加这么多像素（LineDistanceHeight）。
+_LINE_SPACING_PX = 2
 
 
 def content_font() -> QFont:
@@ -43,6 +52,82 @@ def content_font() -> QFont:
         chrome = 9
     font.setPointSize(chrome + _CONTENT_PT_OVER_CHROME)
     return font
+
+
+def apply_windows_appearance(app: QApplication) -> None:
+    """让 Windows 上的窗口跟着系统深色主题，并把界面字号对齐 Ubuntu。
+
+    windowsvista 不读系统深色模式：Qt 能看出 ColorScheme.Dark，画出来的
+    Window/Base 仍是 #f0f0f0 / #ffffff。Ubuntu 上同一套 palette() 会跟着
+    桌面主题变成黑底，所以那边是深色、这边是纯白。
+    """
+    if sys.platform != "win32":
+        return
+    font = app.font()
+    if 0 < font.pointSize() < _UBUNTU_CHROME_PT:
+        font.setPointSize(_UBUNTU_CHROME_PT)
+        app.setFont(font)
+    _apply_windows_color_scheme(app)
+
+
+def _windows_is_dark() -> bool:
+    app = QApplication.instance()
+    if app is None:
+        return False
+    return app.styleHints().colorScheme() == Qt.ColorScheme.Dark
+
+
+def _apply_windows_color_scheme(app: QApplication) -> None:
+    if _windows_is_dark():
+        app.setStyle("Fusion")
+        app.setPalette(_dark_palette())
+        return
+    app.setStyle("windowsvista")
+    app.setPalette(app.style().standardPalette())
+
+
+def _dark_palette() -> QPalette:
+    bg = QColor("#2b2b2b")
+    base = QColor("#1e1e1e")
+    text = QColor("#f2f2f2")
+    mid = QColor("#6a6a6a")
+    button = QColor("#353535")
+    disabled = QColor("#9a9a9a")
+    pal = QPalette()
+    roles = {
+        QPalette.ColorRole.Window: bg,
+        QPalette.ColorRole.WindowText: text,
+        QPalette.ColorRole.Base: base,
+        QPalette.ColorRole.AlternateBase: QColor("#262626"),
+        QPalette.ColorRole.Text: text,
+        QPalette.ColorRole.Button: button,
+        QPalette.ColorRole.ButtonText: text,
+        QPalette.ColorRole.ToolTipBase: QColor("#353535"),
+        QPalette.ColorRole.ToolTipText: text,
+        QPalette.ColorRole.Mid: mid,
+        QPalette.ColorRole.Midlight: QColor("#4a4a4a"),
+        QPalette.ColorRole.Dark: QColor("#141414"),
+        QPalette.ColorRole.Shadow: QColor("#000000"),
+        QPalette.ColorRole.Light: QColor("#5a5a5a"),
+        QPalette.ColorRole.Highlight: QColor("#3d6ea5"),
+        QPalette.ColorRole.HighlightedText: QColor("#ffffff"),
+        QPalette.ColorRole.PlaceholderText: QColor("#a3a3a3"),
+        QPalette.ColorRole.Link: QColor("#8ec5ff"),
+    }
+    for group in (
+        QPalette.ColorGroup.Active,
+        QPalette.ColorGroup.Inactive,
+        QPalette.ColorGroup.Disabled,
+    ):
+        for role, color in roles.items():
+            pal.setColor(group, role, color)
+    for role in (
+        QPalette.ColorRole.WindowText,
+        QPalette.ColorRole.Text,
+        QPalette.ColorRole.ButtonText,
+    ):
+        pal.setColor(QPalette.ColorGroup.Disabled, role, disabled)
+    return pal
 
 if TYPE_CHECKING:
     from app.controller import Controller
@@ -155,6 +240,112 @@ class _AutoToggle(QLabel):
     def _refresh(self):
         color = self._COLOR_ON if self._checked else self._COLOR_OFF
         self.setText(f'<span style="color:{color};">●</span>&nbsp;&nbsp;{self._text}')
+
+
+def _mark_diameter(font: QFont) -> int:
+    # 微软雅黑里的 ● 实际墨迹只有字高的大约三分之一（11pt 时大约 8px），
+    # Ubuntu 字体里的同一个字符接近半个字高。按字高画圆，两边看起来才是一回事。
+    # 圆点按正文字号算，不跟着「空闲 / 自动启停」那 2px 一起缩。
+    return max(14, round(QFontMetrics(font).height() * 0.72))
+
+
+def _font_minus_px(font: QFont, px: int) -> QFont:
+    """同一套字体，字号减小 px 像素。"""
+    smaller = QFont(font)
+    pixel = smaller.pixelSize()
+    if pixel <= 0:
+        screen = QApplication.primaryScreen()
+        dpi = screen.logicalDotsPerInch() if screen is not None else 96.0
+        pixel = round(smaller.pointSizeF() * dpi / 72.0)
+    smaller.setPixelSize(max(1, int(pixel) - px))
+    return smaller
+
+
+class _MarkDot(QWidget):
+    """状态圆点。不使用字体里的 ● / ◌。"""
+
+    def __init__(self, diameter: int, parent=None):
+        super().__init__(parent)
+        self._color = QColor("#6c757d")
+        self._hollow = False
+        self.set_diameter(diameter)
+
+    def set_diameter(self, diameter: int):
+        self._diameter = max(8, int(diameter))
+        self.setFixedSize(self._diameter, self._diameter)
+        self.update()
+
+    def set_mark(self, color: str, hollow: bool):
+        self._color = QColor(color)
+        self._hollow = hollow
+        self.update()
+
+    def paintEvent(self, _event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        side = float(min(self.width(), self.height()))
+        if self._hollow:
+            pen_w = max(1.6, side * 0.12)
+            pen = QPen(self._color)
+            pen.setWidthF(pen_w)
+            p.setPen(pen)
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            inset = pen_w / 2 + 0.5
+            p.drawEllipse(QRectF(inset, inset, side - 2 * inset, side - 2 * inset))
+        else:
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(self._color)
+            inset = 0.5
+            p.drawEllipse(QRectF(inset, inset, side - 2 * inset, side - 2 * inset))
+        p.end()
+
+
+class _PaintedAutoToggle(QWidget):
+    """和 _AutoToggle 同一套开关。Windows 上圆点自己画，不走雅黑的 ●。"""
+
+    toggled = Signal(bool)
+
+    _COLOR_ON = "#28a745"
+    _COLOR_OFF = "#6c757d"
+
+    def __init__(self, text: str, font: QFont, dot_diameter: int, parent=None):
+        super().__init__(parent)
+        self._checked = False
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(8)
+        self._dot = _MarkDot(dot_diameter)
+        self._label = QLabel(text)
+        self._label.setFont(font)
+        self._dot.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self._label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        layout.addWidget(self._dot, alignment=Qt.AlignmentFlag.AlignVCenter)
+        layout.addWidget(self._label, alignment=Qt.AlignmentFlag.AlignVCenter)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._refresh()
+
+    def isChecked(self) -> bool:
+        return self._checked
+
+    def setChecked(self, checked: bool):
+        if checked == self._checked:
+            return
+        self._checked = checked
+        self._refresh()
+
+    def setFont(self, font: QFont):
+        super().setFont(font)
+        self._label.setFont(font)
+
+    def mousePressEvent(self, event):
+        if self.isEnabled() and event.button() == Qt.MouseButton.LeftButton:
+            self.setChecked(not self._checked)
+            self.toggled.emit(self._checked)
+        super().mousePressEvent(event)
+
+    def _refresh(self):
+        color = self._COLOR_ON if self._checked else self._COLOR_OFF
+        self._dot.set_mark(color, hollow=False)
 
 
 # ── Waveform widget ──────────────────────────────────────────────────────────
@@ -315,38 +506,55 @@ _CORRECTING_MARKER = "◌"
 _BTN_HEIGHT = 32
 _BTN_RADIUS = 6
 
-# 禁用态文字固定用这个中灰色，不用 palette(mid)——在某些 Linux 桌面的 Qt 样式引擎下
-# palette(mid) 解析出来对比度不够，深色背景配深色字，糊成一团看不清
-_DISABLED_TEXT_COLOR = "#c8c8c8"
+def _disabled_text_color() -> str:
+    # 不用 palette(mid)：有些 Linux 桌面的 Qt 样式引擎把 mid 解析成和底色差不多的深灰，
+    # 深色背景配深色字，糊成一团。深色底用浅灰；Windows 浅色底如果还用这支浅灰，
+    # 白底上几乎看不见，所以浅色时改成深灰。
+    if sys.platform == "win32" and not _windows_is_dark():
+        return "#5e5e5e"
+    return "#c8c8c8"
 
-_BTN_STYLE = {
-    "start": (
-        f"QPushButton {{ background:#3c8b5d; color:white; border:1px solid #3c8b5d; "
-        f"border-radius:{_BTN_RADIUS}px; padding:0 24px; }}"
-        f"QPushButton:hover {{ background:#357a51; border-color:#357a51; }}"
-        f"QPushButton:disabled {{ background:rgba(128,128,128,0.12); color:{_DISABLED_TEXT_COLOR}; "
-        f"border:1px solid rgba(128,128,128,0.35); }}"
-    ),
-    "stop": (
-        f"QPushButton {{ background:#a33a3a; color:white; border:1px solid #a33a3a; "
-        f"border-radius:{_BTN_RADIUS}px; padding:0 24px; }}"
-        f"QPushButton:hover {{ background:#8f3232; border-color:#8f3232; }}"
-        f"QPushButton:disabled {{ background:rgba(128,128,128,0.12); color:{_DISABLED_TEXT_COLOR}; "
-        f"border:1px solid rgba(128,128,128,0.35); }}"
-    ),
-    "default": (
-        # 底色/描边直接照抄「开始/停止」禁用态的芯片样式（半透明灰底+半透明灰描边），
-        # 不要再单独发明一套纯色描边——之前那样跟禁用态的质感对不上，看着像两套东西
+
+def _button_qss(kind: str) -> str:
+    disabled = _disabled_text_color()
+    if kind == "start":
+        return (
+            f"QPushButton {{ background:#3c8b5d; color:white; border:1px solid #3c8b5d; "
+            f"border-radius:{_BTN_RADIUS}px; padding:0 24px; }}"
+            f"QPushButton:hover {{ background:#357a51; border-color:#357a51; }}"
+            f"QPushButton:disabled {{ background:rgba(128,128,128,0.12); color:{disabled}; "
+            f"border:1px solid rgba(128,128,128,0.35); }}"
+        )
+    if kind == "stop":
+        return (
+            f"QPushButton {{ background:#a33a3a; color:white; border:1px solid #a33a3a; "
+            f"border-radius:{_BTN_RADIUS}px; padding:0 24px; }}"
+            f"QPushButton:hover {{ background:#8f3232; border-color:#8f3232; }}"
+            f"QPushButton:disabled {{ background:rgba(128,128,128,0.12); color:{disabled}; "
+            f"border:1px solid rgba(128,128,128,0.35); }}"
+        )
+    # 底色/描边直接照抄「开始/停止」禁用态的芯片样式（半透明灰底+半透明灰描边），
+    # 不要再单独发明一套纯色描边——之前那样跟禁用态的质感对不上，看着像两套东西。
+    # 文本框为空时清空/复制会被禁用——比启用态芯片更淡一档，一眼能看出点不了。
+    return (
         f"QPushButton {{ background:rgba(128,128,128,0.12); color:palette(text); "
         f"border:1px solid rgba(128,128,128,0.35); border-radius:{_BTN_RADIUS}px; padding:0 22px; }}"
         f"QPushButton:hover {{ background:rgba(128,128,128,0.24); }}"
         f"QPushButton:pressed {{ background:rgba(128,128,128,0.36); }}"
-        # 文本框为空时清空/复制会被禁用——比启用态芯片更淡一档，一眼能看出点不了，
-        # 不依赖样式引擎的默认灰化（不可靠，见前面几轮踩的坑）
-        f"QPushButton:disabled {{ background:rgba(128,128,128,0.06); color:{_DISABLED_TEXT_COLOR}; "
+        f"QPushButton:disabled {{ background:rgba(128,128,128,0.06); color:{disabled}; "
         f"border:1px solid rgba(128,128,128,0.18); }}"
-    ),
-}
+    )
+
+
+_TEXT_AREA_QSS = (
+    "QTextEdit {"
+    " color: palette(text);"
+    " background-color: palette(base);"
+    " border: 1px solid palette(mid);"
+    " border-radius: 8px;"
+    " padding: 14px;"
+    "}"
+)
 
 # QPushButton 的图标和文字之间没有现成的 QSS 间距属性，加一个空格是最简单可靠的办法
 _ICON_TEXT_GAP = " "
@@ -395,6 +603,7 @@ class AppUI(QMainWindow):
         self._base_height = 480   # 初始高度；内容变多时窗口只会往这个基础上长高，不会比它矮
 
         central = QWidget()
+        central.setAutoFillBackground(True)
         self.setCentralWidget(central)
         root = QVBoxLayout(central)
         root.setContentsMargins(8, 8, 8, 8)
@@ -406,12 +615,21 @@ class AppUI(QMainWindow):
         status_row.setSpacing(8)
 
         status_font = content_font()
+        # 「空闲」「自动启停」比正文小 2px。圆点仍按正文字号画，不跟着这 2px 缩。
+        label_font = _font_minus_px(status_font, 2)
 
+        self._status_dot = None
         self._status_label = QLabel()
-        self._status_label.setTextFormat(Qt.TextFormat.RichText)
-        self._status_label.setFont(status_font)
+        self._status_label.setFont(label_font if sys.platform == "win32" else status_font)
+        if sys.platform == "win32":
+            # 雅黑的 ● 会缩成小点，圆点改成按字号画的实心圆
+            self._status_label.setTextFormat(Qt.TextFormat.PlainText)
+            self._status_dot = _MarkDot(_mark_diameter(status_font))
+            status_row.addWidget(self._status_dot, alignment=Qt.AlignmentFlag.AlignVCenter)
+        else:
+            self._status_label.setTextFormat(Qt.TextFormat.RichText)
         self._set_status_text("●", _STATE_LABELS[AppState.IDLE], _STATE_COLORS[AppState.IDLE])
-        status_row.addWidget(self._status_label)
+        status_row.addWidget(self._status_label, alignment=Qt.AlignmentFlag.AlignVCenter)
 
         # 本地校正模型加载状态：与状态栏同字号，非打扰式小字提示
         self._correction_status_label = QLabel("")
@@ -420,25 +638,37 @@ class AppUI(QMainWindow):
 
         status_row.addStretch()
 
-        self._auto_toggle = _AutoToggle("自动启停")
-        self._auto_toggle.setFont(status_font)
+        # 自动启停暂不在界面显示（太敏感、不常用；需要时再 addWidget 加回来）。
+        # 仍保留控件对象——胶囊可见性、自动复制等逻辑会读它的 isChecked()
+        # （不显示即始终 False = 关闭），拿掉对象会牵连一串引用，故只是不摆上去。
+        if sys.platform == "win32":
+            self._auto_toggle = _PaintedAutoToggle(
+                "自动启停", label_font, _mark_diameter(status_font),
+            )
+        else:
+            self._auto_toggle = _AutoToggle("自动启停")
+            self._auto_toggle.setFont(status_font)
         self._auto_toggle.toggled.connect(self._on_auto_toggled)
-        status_row.addWidget(self._auto_toggle)
+        # 注意：故意不 status_row.addWidget(self._auto_toggle) —— 界面上不显示。
+
+        # 邮件模式开关：占状态行右侧原自动启停的位置。勾选后，录音结束把口述
+        # 内容改写成采购主管口吻的邮件正文，而不是逐字转写校正。
+        if sys.platform == "win32":
+            self._email_toggle = _PaintedAutoToggle(
+                "邮件", label_font, _mark_diameter(status_font),
+            )
+        else:
+            self._email_toggle = _AutoToggle("邮件")
+            self._email_toggle.setFont(status_font)
+        self._email_toggle.toggled.connect(self._on_email_toggled)
+        status_row.addWidget(self._email_toggle)
 
         root.addLayout(status_row)
 
         # Text area
         self._text_area = QTextEdit()
         self._text_area.setPlaceholderText("识别结果…")
-        self._text_area.setStyleSheet(
-            "QTextEdit {"
-            " color: palette(text);"
-            " background-color: palette(base);"
-            " border: 1px solid palette(mid);"
-            " border-radius: 8px;"
-            " padding: 14px;"
-            "}"
-        )
+        self._text_area.setStyleSheet(_TEXT_AREA_QSS)
         self._text_area.setCursorWidth(2)
         self._text_area.setFont(content_font())
         self._text_area.setLineWrapMode(QTextEdit.LineWrapMode.WidgetWidth)
@@ -471,34 +701,22 @@ class AppUI(QMainWindow):
         # 四个按钮文案/图标固定不变，不随状态切换（之前加过「暂停监听」之类的动态文案，改多了，撤回）
         self._btn_start = QPushButton(_ICON_TEXT_GAP + "开始")
         self._btn_start.setIcon(self._icon_mic)
-        self._btn_start.setStyleSheet(_BTN_STYLE["start"])
         self._btn_start.clicked.connect(self._on_start)
 
         self._btn_stop = QPushButton(_ICON_TEXT_GAP + "停止")
         self._btn_stop.setIcon(self._icon_square)
-        self._btn_stop.setStyleSheet(_BTN_STYLE["stop"])
         self._btn_stop.setEnabled(False)
         self._btn_stop.clicked.connect(self._on_stop)
 
-        # 有些 Linux 桌面的 Qt 样式引擎不会完全听 QSS 里的 color，文字会退回主题默认色
-        # （深色主题下就是黑字配深色底，糊成一团）——调色板的 ButtonText 也显式设一遍兜底，
-        # 启用态和禁用态（Disabled 分组）都要设，只设启用态的话按钮一变灰问题就又出现了
-        for b in (self._btn_start, self._btn_stop):
-            pal = b.palette()
-            pal.setColor(QPalette.ColorGroup.Active, QPalette.ColorRole.ButtonText, QColor("white"))
-            pal.setColor(QPalette.ColorGroup.Inactive, QPalette.ColorRole.ButtonText, QColor("white"))
-            pal.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.ButtonText, QColor(_DISABLED_TEXT_COLOR))
-            b.setPalette(pal)
-
         self._btn_clear = QPushButton(_ICON_TEXT_GAP + "清空")
         self._btn_clear.setIcon(self._icon_trash)
-        self._btn_clear.setStyleSheet(_BTN_STYLE["default"])
         self._btn_clear.clicked.connect(self._on_clear)
 
         self._btn_copy = QPushButton(_ICON_TEXT_GAP + "复制")
         self._btn_copy.setIcon(self._icon_copy)
-        self._btn_copy.setStyleSheet(_BTN_STYLE["default"])
         self._btn_copy.clicked.connect(self._on_copy)
+
+        self._apply_button_chrome()
 
         # 文本框还是空的（只有 placeholder），启动时清空/复制先禁用
         self._btn_clear.setEnabled(False)
@@ -529,6 +747,9 @@ class AppUI(QMainWindow):
         # 甚至可以被最小化的时候还能常驻后台。dock 下面显示两个点这个瑕疵
         # 目前没有能两全的办法（原生 Wayland 下 Qt 没有可靠的"从任务栏隐藏
         # 顶层窗口"协议，不挂 parent 才是唯一路径），两害相权，保功能优先。
+        if sys.platform == "win32":
+            QApplication.styleHints().colorSchemeChanged.connect(self._on_system_color_scheme)
+
         self._capsule = VoiceCapsule(
             on_show_main=self._show_main_window,
             on_stop=self._on_stop,   # 复用现成的手动停止逻辑
@@ -547,10 +768,27 @@ class AppUI(QMainWindow):
             return
         self._programmatic_change = True
         self._text_area.setPlainText(text)
+        self._apply_line_spacing()   # setPlainText 会重置块格式，重新施加行距
         cursor = self._text_area.textCursor()
         cursor.movePosition(cursor.MoveOperation.End)
         self._text_area.setTextCursor(cursor)
         self._programmatic_change = False
+
+    def _apply_line_spacing(self):
+        """给文本框所有段落施加统一行距（+_LINE_SPACING_PX 像素）。
+
+        QTextEdit 没有「默认行距」接口，setPlainText 又会重置块格式，所以每次
+        设文本后对整篇重新 merge 一次块格式。用户后续在已有段落里输入/换行时，
+        新段落会继承当前段落的块格式，行距自然保持。调用方负责 _programmatic_change
+        守卫（本方法会触发 textChanged）。"""
+        block_fmt = QTextBlockFormat()
+        block_fmt.setLineHeight(
+            _LINE_SPACING_PX,
+            QTextBlockFormat.LineHeightTypes.LineDistanceHeight.value,
+        )
+        cursor = self._text_area.textCursor()
+        cursor.select(QTextCursor.SelectionType.Document)
+        cursor.mergeBlockFormat(block_fmt)   # 只合并行距，不动对齐等其它块属性
 
     def get_text(self) -> str:
         return self._text_area.toPlainText()
@@ -631,8 +869,47 @@ class AppUI(QMainWindow):
             self.apply_state(self._controller._state)
 
     def _set_status_text(self, marker: str, label: str, color: str):
+        if self._status_dot is not None:
+            self._status_dot.set_mark(color, hollow=(marker != "●"))
+            self._status_label.setText(label)
+            return
         # 圆点后面留一点呼吸感，一个空格太紧
         self._status_label.setText(f'<span style="color:{color};">{marker}</span>&nbsp;&nbsp;{label}')
+
+    def _apply_button_chrome(self):
+        self._btn_start.setStyleSheet(_button_qss("start"))
+        self._btn_stop.setStyleSheet(_button_qss("stop"))
+        self._btn_clear.setStyleSheet(_button_qss("default"))
+        self._btn_copy.setStyleSheet(_button_qss("default"))
+        # 有些 Linux 桌面的 Qt 样式引擎不会完全听 QSS 里的 color，文字会退回主题默认色
+        # （深色主题下就是黑字配深色底，糊成一团）——调色板的 ButtonText 也显式设一遍兜底，
+        # 启用态和禁用态（Disabled 分组）都要设，只设启用态的话按钮一变灰问题就又出现了
+        disabled = QColor(_disabled_text_color())
+        for b in (self._btn_start, self._btn_stop):
+            pal = b.palette()
+            pal.setColor(QPalette.ColorGroup.Active, QPalette.ColorRole.ButtonText, QColor("white"))
+            pal.setColor(QPalette.ColorGroup.Inactive, QPalette.ColorRole.ButtonText, QColor("white"))
+            pal.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.ButtonText, disabled)
+            b.setPalette(pal)
+        self._recolor_ghost_icons()
+
+    def _recolor_ghost_icons(self):
+        color = self.palette().color(QPalette.ColorRole.WindowText).name()
+        self._icon_trash = _svg_icon(_SVG_TRASH, color)
+        self._icon_copy = _svg_icon(_SVG_COPY, color)
+        self._icon_check = _svg_icon(_SVG_CHECK, color)
+        self._btn_clear.setIcon(self._icon_trash)
+        self._btn_copy.setIcon(self._icon_copy)
+
+    def _on_system_color_scheme(self, _scheme):
+        app = QApplication.instance()
+        if app is None:
+            return
+        _apply_windows_color_scheme(app)
+        # 同一段 QSS 再设一次，Qt 不一定会重算 palette()。先清空再写回去。
+        self._text_area.setStyleSheet("")
+        self._text_area.setStyleSheet(_TEXT_AREA_QSS)
+        self._apply_button_chrome()
 
     def set_correction_status(self, status: str):
         """本地校正模型加载状态：initializing / ready / failed，非打扰式小字提示。"""
@@ -715,6 +992,12 @@ class AppUI(QMainWindow):
             self.hide()
         else:
             self._controller.stop()
+
+    def _on_email_toggled(self, checked: bool):
+        """邮件模式开关：只记录模式，不触发启停。勾选后，本次（及之后）录音
+        结束会把口述内容生成为采购主管口吻的邮件，而不是逐字转写校正。"""
+        if self._controller:
+            self._controller.set_email_mode(checked)
 
     def _on_clear(self):
         # 取消未完成的编辑防抖，避免清空后又被旧文本 rebase 回来（表现为要点两次）

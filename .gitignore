@@ -13,6 +13,9 @@ build/
 *.swp
 *.swo
 secrets.yaml
+# 加密凭据包的「口令」和「明文」绝不进仓库；secrets.enc（加密后）才提交
+security/.passphrase
+security/secrets.plain.json
 models/
 identifier.sqlite
 
