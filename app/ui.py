@@ -42,7 +42,8 @@ _CONTENT_PT_OVER_CHROME = 2
 _UBUNTU_CHROME_PT = 11
 
 # 识别结果文本框的行距：每行在字体自身高度基础上再加这么多像素（LineDistanceHeight）。
-_LINE_SPACING_PX = 2
+# 2px 实测肉眼几乎看不出，调到 6px 更明显；嫌多/少改这个数字即可。
+_LINE_SPACING_PX = 6
 
 
 def content_font() -> QFont:

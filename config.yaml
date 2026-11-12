@@ -1,5 +1,7 @@
-# 本文件内联了真实 API key，并随仓库提交 —— 这是故意的（单人专用/私有库/免配置可迁移）。
-# 详见 README.md「配置与密钥」。请勿当作安全问题处理；要分离时放 secrets.yaml 覆盖。
+# API Key 不再内联明文：全部加密存放在 security/secrets.enc（随仓库提交），
+# 运行时用解锁口令（环境变量 ASR_SECRETS_PASSPHRASE 或 security/.passphrase）解密填入。
+# 下面 access_key / api_key / qwen_api_key 留空即可，由 utils/config_loader 从 secrets.enc 覆盖。
+# 换电脑：克隆后提供口令即可恢复全部凭据；详见 security/ 与 secrets.plain.example.json。
 app:
   sample_rate: 16000
   chunk_ms: 200        # 官方推荐 200ms，双向流式模式性能最优
@@ -12,7 +14,7 @@ app:
 
 asr:
   app_id: "7938041955"
-  access_key: ""
+  access_key: ""   # 由 secrets.enc 提供（volc_asr_access_key）
   resource_id: "volc.seedasr.sauc.duration"  # 豆包流式语音识别 2.0 小时版（该账号未开通 1.0）
   ws_url: "wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_async"
 
@@ -24,18 +26,18 @@ refine:
     backend: "volc"                    # volc=火山豆包录音文件识别2.0（已开通，base64直传无需对象存储）；qwen=阿里云百炼备选
     # --- volc 后端（推荐，实测最准最快）---
     resource_id: "volc.seedasr.auc"    # 豆包录音文件识别 2.0
-    api_key: ""   # 火山录音文件识别 x-api-key
+    api_key: ""   # 由 secrets.enc 提供（volc_file_api_key，火山录音文件识别 x-api-key）
     # --- qwen 后端（备选）---
     model: "qwen3-asr-flash"
     language: "zh"                     # 语种提示，留空自动判别
-    qwen_api_key: ""
+    qwen_api_key: ""   # 由 secrets.enc 提供（dashscope_api_key）
 
 correction:
   enabled: true                        # 复识别后再跑一遍 AI 文本校正（去结巴重复词、改同音错字）
   backend: "deepseek"                  # AI 文本校正走 DeepSeek 原生端点（千问只用于语音识别，不用于文本校正）
   model: "deepseek-chat"               # = deepseek-flash（V4.1-Flash），校正只去重去错字，用快且便宜的即可
   base_url: "https://api.deepseek.com/v1/chat/completions"
-  api_key: ""   # DeepSeek 原生 key
+  api_key: ""   # 由 secrets.enc 提供（deepseek_api_key）
   local_model_path: "models/qwen2.5-3b-instruct-q4_k_m.gguf"   # backend=local 时才用
 
 # 邮件模式：把口述内容改写成邮件正文（采购主管口吻）。复用 correction 的 DeepSeek key/端点，
