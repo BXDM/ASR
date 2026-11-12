@@ -13,7 +13,9 @@ build/
 *.swp
 *.swo
 secrets.yaml
-# 加密凭据包的「口令」和「明文」绝不进仓库；secrets.enc（加密后）才提交
+# 明文 Key 清单与解锁口令默认不进仓库；secrets.enc（加密后）才提交。
+# 若要让口令也随库走（私有库免配置迁移、放弃保密性，见 security/README.md），
+# 自行 `git add -f security/.passphrase` 强制加入。
 security/.passphrase
 security/secrets.plain.json
 models/
