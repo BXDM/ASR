@@ -23,9 +23,9 @@ def _set_path(cfg: dict, path: tuple, value) -> None:
 
 
 def _apply_sealed_secrets(config: dict) -> None:
-    """若存在加密凭据包 security/secrets.enc 且能解锁，用其中的 Key 覆盖 config。
+    """若存在加密凭据包 security/api.key 且能解锁，用其中的 Key 覆盖 config。
 
-    这样 config.yaml 里可以不放明文 Key（留空即可），换电脑克隆后只要提供解锁口令
+    这样 config.yaml 里可以不放明文 Key（留空即可），换电脑时拷贝 api.key 并提供解锁口令
     （环境变量 ASR_SECRETS_PASSPHRASE 或 security/.passphrase）就能恢复全部凭据。
     解锁失败（无文件/缺口令/口令错/未装 cryptography）都不抛出，沿用 config.yaml 原值。
     """

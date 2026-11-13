@@ -1,13 +1,13 @@
 """
 统一加密凭据模块（SecretProvider）。
 
-目标：所有 API Key 加密存放在 security/secrets.enc（可随仓库一起提交、跨电脑使用），
+目标：所有 API Key 加密存放在 security/api.key（已 gitignore，不进仓库），
 用一个「解锁口令」在运行时解密到内存；口令本身绝不进仓库。业务侧只需 get_key(name)。
 
 加密链路（不自造算法）：
     口令 --scrypt(标准库 KDF)--> 32B 密钥 --Fernet(AES128-CBC + HMAC 认证加密)--> 密文
 
-secrets.enc 是一个 JSON 文本文件（git 友好），内含 KDF 盐、参数与 Fernet 密文。
+api.key 是一个 JSON 文本文件（git 友好），内含 KDF 盐、参数与 Fernet 密文。
 解锁口令按以下顺序解析：显式传入 > 环境变量 ASR_SECRETS_PASSPHRASE > security/.passphrase 文件。
 """
 
@@ -20,7 +20,7 @@ import os
 import threading
 from pathlib import Path
 
-_ENC_NAME = "secrets.enc"
+_ENC_NAME = "api.key"                # 加密后的 Key 包（已在 .gitignore，不进仓库）
 _PASSPHRASE_ENV = "ASR_SECRETS_PASSPHRASE"
 _PASSPHRASE_FILE = ".passphrase"          # security/.passphrase（已在 .gitignore，不进仓库）
 
@@ -37,7 +37,7 @@ def _fernet_key(passphrase: str, salt: bytes, n: int, r: int, p: int) -> bytes:
 
 
 def seal_secrets(secrets: dict, passphrase: str, enc_path: Path = _ENC_PATH) -> None:
-    """把明文 {name: key} 字典加密写入 secrets.enc。"""
+    """把明文 {name: key} 字典加密写入 api.key。"""
     from cryptography.fernet import Fernet
     salt = os.urandom(16)
     f = Fernet(_fernet_key(passphrase, salt, _N, _R, _P))
@@ -53,7 +53,7 @@ def seal_secrets(secrets: dict, passphrase: str, enc_path: Path = _ENC_PATH) -> 
 
 
 def open_sealed(enc_path: Path, passphrase: str) -> dict:
-    """用口令解密 secrets.enc，返回 {name: key} 字典。口令错/文件损坏抛 ValueError。"""
+    """用口令解密 api.key，返回 {name: key} 字典。口令错/文件损坏抛 ValueError。"""
     from cryptography.fernet import Fernet, InvalidToken
     blob = json.loads(enc_path.read_text(encoding="utf-8"))
     salt = base64.b64decode(blob["salt"])
@@ -62,7 +62,7 @@ def open_sealed(enc_path: Path, passphrase: str) -> dict:
     try:
         data = f.decrypt(blob["ciphertext"].encode("ascii"))
     except InvalidToken as e:
-        raise ValueError("解锁口令错误，或 secrets.enc 已损坏") from e
+        raise ValueError("解锁口令错误，或 api.key 已损坏") from e
     return json.loads(data.decode("utf-8"))
 
 
@@ -91,7 +91,7 @@ class SecretProvider:
         return self._enc_path.exists()
 
     def unlock(self, passphrase: str | None = None) -> bool:
-        """解密并缓存。无 secrets.enc 返回 False；缺口令抛 RuntimeError；口令错抛 ValueError。"""
+        """解密并缓存。无 api.key 返回 False；缺口令抛 RuntimeError；口令错抛 ValueError。"""
         with self._lock:
             if self._secrets is not None:
                 return True

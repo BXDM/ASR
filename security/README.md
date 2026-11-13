@@ -1,26 +1,26 @@
 # security/ — 加密凭据模块
 
-所有 API Key 加密存放在 `secrets.enc`（随仓库提交），运行时用「解锁口令」解密到内存。
-业务代码不出现明文 Key；换电脑克隆后，提供口令即可恢复全部凭据。
+所有 API Key 加密存放在 `api.key`（**已 gitignore，不进仓库**），运行时用「解锁口令」解密到内存。
+业务代码不出现明文 Key；换电脑时把 `security/api.key` 拷过去并提供口令即可恢复全部凭据。
 
 ## 组成
 
 | 文件 | 说明 | 进仓库？ |
 |---|---|---|
 | `secret_provider.py` | 读取/加解密（`get_key(name)`） | ✅ |
-| `seal.py` | 把明文 Key 封进 `secrets.enc` 的工具 | ✅ |
-| `secrets.enc` | 加密后的全部 Key（scrypt + Fernet） | ✅ |
+| `seal.py` | 把明文 Key 封进 `api.key` 的工具 | ✅ |
+| `api.key` | 加密后的全部 Key（scrypt + Fernet） | ❌ gitignore |
 | `secrets.plain.example.json` | 明文填写模板 | ✅ |
 | `secrets.plain.json` | 你填的明文（临时用） | ❌ gitignore |
-| `.passphrase` | 解锁口令 | ⚠️ 见下 |
+| `.passphrase` | 解锁口令 | ❌ gitignore |
 
 ## 加解密原理（不自造算法）
 
 ```
-口令 --scrypt(标准库 KDF)--> 32B 密钥 --Fernet(AES128-CBC + HMAC 认证加密)--> secrets.enc
+口令 --scrypt(标准库 KDF)--> 32B 密钥 --Fernet(AES128-CBC + HMAC 认证加密)--> api.key
 ```
 
-`utils/config_loader.py` 在加载 `config.yaml` 后，若 `secrets.enc` 存在且能解锁，
+`utils/config_loader.py` 在加载 `config.yaml` 后，若 `api.key` 存在且能解锁，
 就把其中的 Key 覆盖进 config（`config.yaml` 里对应字段留空即可）。
 
 ## 口令来源（按优先级）
@@ -43,17 +43,11 @@ python -m security.seal
 python -m security.seal --show
 ```
 
-换电脑：克隆仓库 → 设 `ASR_SECRETS_PASSPHRASE` 或写 `security/.passphrase` → 直接运行。
+换电脑：克隆仓库 → 拷入 `security/api.key` → 设 `ASR_SECRETS_PASSPHRASE` 或写 `security/.passphrase` → 直接运行。
 
-## ⚠️ 关于 `.passphrase` 随仓库提交的取舍
+## ⚠️ 安全约定
 
-本项目选择把 `.passphrase` **也提交进仓库**，图的是「克隆下来零配置即可运行」。
-
-**这会使加密失去保密性**：密文（`secrets.enc`）与口令（`.passphrase`）同在一个仓库，
-任何能访问该仓库的人都能解出全部 Key——效果等同于直接提交明文 Key。
-
-因此：
-
-- **本仓库必须始终保持私有（private）。**
-- 一旦转为公开或被转发，火山 / 千问 / DeepSeek 等全部 Key **立即泄露**，且永久留在 git 历史里，需逐个到各平台控制台重置。
-- 想要真正的保密性：把 `.passphrase` 重新加入 `.gitignore`、不提交口令，换电脑时手动提供口令即可。
+- `api.key`、`.passphrase`、`secrets.plain.json` 都在 `.gitignore`，**均不进仓库**。
+- 密文和口令都不在仓库里，即使仓库公开也不会泄露 Key。
+- 用 U 盘 / 网盘等私下方式在电脑间同步 `api.key`；口令单独记住或放密码管理器。
+- 提交前可 `git status` 确认没有 `*.key` 文件被加入。

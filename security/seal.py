@@ -1,5 +1,5 @@
 """
-把明文 API Key 加密成 security/secrets.enc（可提交到仓库）。
+把明文 API Key 加密成 security/api.key（已 gitignore，不进仓库）。
 
 在项目根目录运行：
 
@@ -11,7 +11,7 @@
   #   2) python -m security.seal
   #   （secrets.plain.json 已在 .gitignore，不会进仓库；用完可删）
 
-  # 验证 secrets.enc（只打印 Key 名、不打印值）
+  # 验证 api.key（只打印 Key 名、不打印值）
   python -m security.seal --show
 
 口令来源：环境变量 ASR_SECRETS_PASSPHRASE，否则交互式输入。
@@ -79,7 +79,7 @@ def main():
 
     if "--show" in args:
         secrets = open_sealed(_ENC_PATH, _passphrase())
-        print(f"secrets.enc 含 {len(secrets)} 个凭据:", ", ".join(sorted(secrets)))
+        print(f"api.key 含 {len(secrets)} 个凭据:", ", ".join(sorted(secrets)))
         return
 
     if "--from-config" in args:
@@ -94,7 +94,7 @@ def main():
         secrets = json.loads(_PLAIN.read_text(encoding="utf-8"))
 
     seal_secrets(secrets, _passphrase(confirm=True))
-    print(f"已生成 {_ENC_PATH}（{len(secrets)} 个凭据）。该文件可提交到仓库。")
+    print(f"已生成 {_ENC_PATH}（{len(secrets)} 个凭据）。该文件已在 .gitignore，不会进仓库；换电脑需手动拷贝。")
     print("下一步：设 ASR_SECRETS_PASSPHRASE 或写 security/.passphrase；随后清空 config.yaml 里的明文 Key。")
     print("切勿提交：明文口令、security/.passphrase、security/secrets.plain.json。")
 

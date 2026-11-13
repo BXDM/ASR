@@ -26,3 +26,8 @@ vocab.json
 
 # 评测录音样本
 benchmark/samples/
+
+# 加密后的 API Key 包：绝不进仓库（换电脑手动拷贝 security/api.key）
+api.key
+*.key
+security/secrets.enc
